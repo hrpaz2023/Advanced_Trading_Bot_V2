@@ -1,13 +1,13 @@
 # main_bot.py — encabezado (imports principales + instancias globales)
 # ------------------------------------------------------------------
-import os, sys, csv, time, json, signal, logging, threading, datetime
-from dataclasses import dataclass, field
+import os, sys, csv, time, json, signal, logging, threading
 from typing import Dict, Any, List, Optional
 from datetime import datetime as dt
 import pytz
 import pandas as pd  # ⇦ NUEVO
 from pathlib import Path      # ⇦ NUEVO
-from datetime import datetime, timezone
+import datetime as dt            # dt es el MÓDULO (dt.datetime.now/utcnow)
+from datetime import timezone    # para timezone.utc
 
 # --- PMI ---------------------------------------------------------------------
 from pmi.smart_position_manager import SmartPositionManager
@@ -143,7 +143,7 @@ def setup_logging():
 
 # ---------- HELPERS ----------
 def safe_now_utc():
-    return datetime.now(timezone.utc)
+    return dt.datetime.now(timezone.utc)
 
 
 def log_signal_for_backtest(row: Dict[str, Any], path: str = "logs/signals_history.csv"):
@@ -679,59 +679,51 @@ class OrchestratedMT5Bot:
 
 
     # ------------------------------------------------------------------
-    # Helper: descarga velas de MT5 y las devuelve en un DataFrame
+    # Helper: descarga velas y guarda snapshot .parquet
     # ------------------------------------------------------------------
-    def _fetch_candles(self,
-                       symbol: str,
-                       timeframe: str = "M5",
-                       n: int = 400):
+    def _fetch_candles(self, symbol: str, timeframe: str = "M5", n: int = 400):
         """
-        Devuelve un DataFrame con las últimas *n* velas del símbolo.
-
-        Columnas ⇒ ['time','open','high','low','close','volume','spread','real_volume'].
-        Si MT5 no está disponible o falla la consulta, retorna None.
-
-        Args
-        ----
-        symbol : str      Símbolo, p.ej. 'EURUSD'
-        timeframe : str   'M1','M5','H1', etc.
-        n : int           Número de velas a copiar
+        Devuelve un DataFrame con las últimas *n* velas del símbolo
+        y guarda un snapshot de las últimas 200 en data/candles/<símbolo>/.
         """
-        # 1) Verificaciones básicas
         if not MT5_AVAILABLE or not self.mt5_connected:
             self.logger.warning(f"_fetch_candles: MT5 no disponible para {symbol}.")
             return None
 
-        # 2) Mapear timeframe string → constante MT5
         tf_map = {
-            "M1":  mt5.TIMEFRAME_M1,
-            "M2":  mt5.TIMEFRAME_M2,
-            "M3":  mt5.TIMEFRAME_M3,
-            "M4":  mt5.TIMEFRAME_M4,
-            "M5":  mt5.TIMEFRAME_M5,
-            "M15": mt5.TIMEFRAME_M15,
-            "M30": mt5.TIMEFRAME_M30,
-            "H1":  mt5.TIMEFRAME_H1,
-            "H4":  mt5.TIMEFRAME_H4,
-            "D1":  mt5.TIMEFRAME_D1,
+            "M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5,
+            "M15": mt5.TIMEFRAME_M15, "M30": mt5.TIMEFRAME_M30,
+            "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4, "D1": mt5.TIMEFRAME_D1,
         }
         tf_const = tf_map.get(timeframe.upper(), mt5.TIMEFRAME_M5)
 
-        # 3) Copiar rates
         try:
             rates = mt5.copy_rates_from_pos(symbol, tf_const, 0, n)
-            if rates is None or len(rates) == 0:
+            if not rates:
                 self.logger.warning(f"_fetch_candles: sin datos para {symbol}")
                 return None
+
             df = pd.DataFrame(rates)
             df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
             df.rename(columns={"tick_volume": "volume"}, inplace=True)
+
+            # ---------- Snapshot ----------
+            try:
+                ts = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                out_dir = Path("data") / "candles" / symbol
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_file = out_dir / f"{symbol}_{ts}.parquet"
+                df.tail(200).to_parquet(out_file, index=False)
+                self.logger.debug(f"Snapshot velas {symbol} → {out_file}")
+            except Exception as e:
+                self.logger.warning(f"No pude guardar snapshot velas {symbol}: {e}")
+            # ------------------------------
+
             return df
+
         except Exception as e:
             self.logger.error(f"_fetch_candles: error copiando velas {symbol}: {e}")
             return None
-
-
 
     # ------------------------------------------------------------------
     # PMI – evaluación en modo observador
@@ -1085,17 +1077,6 @@ class OrchestratedMT5Bot:
                             output = format_signal_output(c.symbol, c.strategy_name, signal_data,
                                                         verdict, execution_result, news_blocked, position_blocked)
                             print(output)
-
-                            # ─────── GUARDAR SNAPSHOT ───────
-                            try:
-                                ts = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-                                out_dir  = Path("data") / "candles" / symbol
-                                out_dir.mkdir(parents=True, exist_ok=True)
-                                out_file = out_dir / f"{symbol}_{ts}.parquet"
-                                df.tail(200).to_parquet(out_file, index=False)
-                                self.logger.debug(f"Snapshot velas {symbol} → {out_file}")
-                            except Exception as e:
-                                self.logger.warning(f"No pude guardar snapshot velas {symbol}: {e}")
 
                         finally:
                             proc_time = time.perf_counter() - t0
