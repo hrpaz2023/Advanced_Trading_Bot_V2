@@ -369,6 +369,8 @@ class OrchestratedMT5Bot:
         # --- NUEVOS/CLAVE: pmi opcional (y compatibilidad) ---
         pmi: SmartPositionManager | None = None,
         trend_detector: TrendChangeDetector | None = None,
+        self.pmi_active = kwargs.get("pmi_active", False)   # False = observador
+        self.pmi_partial_close_ratio = kwargs.get("pmi_partial_close_ratio", 0.5)
         **kwargs,
     ):
         """
@@ -763,6 +765,146 @@ class OrchestratedMT5Bot:
             self.logger.error(f"_fetch_candles: error copiando velas {symbol}: {e}")
             return None
 
+    # ------------------------------------------------------------------
+    # PMI: recoger posiciones vivas desde TradingClient o MT5
+    # ------------------------------------------------------------------
+    def _collect_open_positions(self) -> list[dict]:
+        """
+        Devuelve una lista de posiciones con campos mínimos:
+        ticket, symbol, volume, price_open, sl, tp, time
+        """
+        # 1) Intenta usar tu TradingClient si existe
+        try:
+            if hasattr(self, "trading_client") and hasattr(self.trading_client, "get_open_positions"):
+                pos = self.trading_client.get_open_positions()
+                if isinstance(pos, list):
+                    return pos
+        except Exception as e:
+            self.logger.warning(f"PMI: trading_client.get_open_positions() falló: {e}")
+
+        # 2) Fallback a MT5 nativo
+        try:
+            import MetaTrader5 as mt5  # por si no está en el scope
+            raw = mt5.positions_get()
+            out = []
+            if raw:
+                for p in raw:
+                    out.append({
+                        "ticket": int(p.ticket),
+                        "symbol": str(p.symbol),
+                        "volume": float(p.volume),
+                        "price_open": float(p.price_open),
+                        "sl": float(p.sl) if hasattr(p, "sl") else None,
+                        "tp": float(p.tp) if hasattr(p, "tp") else None,
+                        "time": int(p.time),  # epoch
+                    })
+            return out
+        except Exception as e:
+            self.logger.warning(f"PMI: mt5.positions_get() falló: {e}")
+            return []
+
+    # ------------------------------------------------------------------
+    # PMI: aplicar decisión (modo activo opcional)
+    # ------------------------------------------------------------------
+    def _apply_pmi_decision(self, decision: "PMIDecision", position: dict) -> None:
+        """
+        Mapea la decisión del PMI a acciones reales.
+        Requiere que self.pmi_active sea True para ejecutar.
+        """
+        if not getattr(self, "pmi_active", False):
+            return  # modo observador
+
+        action = str(decision.action).upper()  # 'CLOSE' / 'PARTIAL_CLOSE' / 'TIGHTEN_SL' / 'HOLD'
+        ticket = int(decision.ticket)
+        symbol = str(position.get("symbol"))
+        volume = float(position.get("volume", 0.0))
+
+        # ratios/parametría
+        partial_ratio = getattr(self, "pmi_partial_close_ratio", 0.5)
+
+        try:
+            if action == "CLOSE":
+                # cierra todo
+                if hasattr(self, "trading_client") and hasattr(self.trading_client, "close_position"):
+                    self.trading_client.close_position(ticket=ticket)
+                    self.logger.info(f"PMI: CLOSE ejecutado ticket={ticket} ({symbol})")
+            elif action == "PARTIAL_CLOSE":
+                vol_to_close = max(0.0, round(volume * partial_ratio, 2))
+                if vol_to_close > 0 and hasattr(self.trading_client, "partial_close"):
+                    self.trading_client.partial_close(ticket=ticket, volume=vol_to_close)
+                    self.logger.info(f"PMI: PARTIAL_CLOSE {vol_to_close} lotes ticket={ticket} ({symbol})")
+            elif action == "TIGHTEN_SL":
+                # ejemplo básico: mover SL a break-even si existe API
+                if hasattr(self.trading_client, "move_stop_to_be"):
+                    self.trading_client.move_stop_to_be(ticket=ticket)
+                    self.logger.info(f"PMI: TIGHTEN_SL → BE ticket={ticket} ({symbol})")
+            # HOLD no hace nada
+        except Exception as e:
+            self.logger.error(f"PMI: error aplicando acción {action} ticket={ticket}: {e}")
+
+        # --- Paso PMI por ciclo (observer/activo) ---
+        try:
+            self._pmi_integration_step(candles_by_symbol)
+        except Exception as e:
+            self.logger.error(f"PMI step error: {e}")    
+
+    # ------------------------------------------------------------------
+    # PMI: paso de integración por ciclo
+    # ------------------------------------------------------------------
+    def _pmi_integration_step(self, candles_by_symbol: dict[str, "pd.DataFrame"]) -> None:
+        """
+        1) Lee posiciones abiertas
+        2) Arma market_snapshot básico (close, atr_rel si lo tenés)
+        3) Llama a PMI.evaluate(...)
+        4) Loguea decisiones y (si pmi_active) ejecuta acciones
+        """
+        # 1) posiciones vivas
+        positions = self._collect_open_positions()
+        if not positions:
+            return
+
+        # 2) market_snapshot a partir de velas ya disponibles
+        snapshot: dict[str, dict] = {}
+        for sym, df in (candles_by_symbol or {}).items():
+            try:
+                last_close = float(df["close"].iloc[-1])
+                # atr relativo opcional si ya lo calculás en df (si no, queda en 0.0)
+                atr_rel = float(df.get("atr_rel", pd.Series([0.0])).iloc[-1]) if isinstance(df, pd.DataFrame) else 0.0
+                snapshot[sym] = {"close": last_close, "atr_rel": atr_rel}
+            except Exception:
+                pass
+
+        # 3) evaluar con PMI (pasamos velas para que el TCD funcione sin I/O)
+        now_utc = dt.datetime.now(timezone.utc)
+        decisions = self.pmi.evaluate(
+            positions=positions,
+            market_snapshot=snapshot,
+            candles_by_symbol=candles_by_symbol,
+            now=now_utc,
+        )
+
+        # 4) registrar y (opcional) ejecutar
+        try:
+            from pmi.logger import log_pmi_decision
+        except Exception:
+            def log_pmi_decision(*args, **kwargs):
+                return False  # fallback silencioso
+
+        for dec in decisions:
+            # log JSONL
+            try:
+                log_pmi_decision(dec)
+            except Exception as e:
+                self.logger.warning(f"PMI: no pude loguear decisión {dec}: {e}")
+
+            # si modo activo, buscar la posición completa por ticket y aplicar
+            if getattr(self, "pmi_active", False):
+                try:
+                    pos = next((p for p in positions if int(p.get("ticket")) == int(dec.ticket)), None)
+                    if pos:
+                        self._apply_pmi_decision(decision=dec, position=pos)
+                except Exception as e:
+                    self.logger.error(f"PMI: error aplicando decisión {dec}: {e}")
 
 
     # ------------------------------------------------------------------
