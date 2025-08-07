@@ -1,0 +1,176 @@
+{
+  "root": "E:\\Cryptos\\Advanced_Trading_Bot_V2",
+  "config": "E:\\Cryptos\\Advanced_Trading_Bot_V2\\configs\\global_config.json",
+  "models_dir": "E:\\Cryptos\\Advanced_Trading_Bot_V2\\models",
+  "chroma_path": "db/chroma_db",
+  "global_insights_present": true,
+  "results": [
+    {
+      "symbol": "EURUSD",
+      "strategy": "ema_crossover",
+      "ml_ok": "YES",
+      "ml_missing": "",
+      "chroma_ok": "YES",
+      "chroma_status": "ok_num"
+    },
+    {
+      "symbol": "EURUSD",
+      "strategy": "channel_reversal",
+      "ml_ok": "YES",
+      "ml_missing": "",
+      "chroma_ok": "YES",
+      "chroma_status": "ok_num"
+    },
+    {
+      "symbol": "EURUSD",
+      "strategy": "multi_filter_scalper",
+      "ml_ok": "YES",
+      "ml_missing": "",
+      "chroma_ok": "YES",
+      "chroma_status": "ok_num"
+    },
+    {
+      "symbol": "EURUSD",
+      "strategy": "rsi_pullback",
+      "ml_ok": "YES",
+      "ml_missing": "",
+      "chroma_ok": "YES",
+      "chroma_status": "ok_num"
+    },
+    {
+      "symbol": "EURUSD",
+      "strategy": "volatility_breakout",
+      "ml_ok": "YES",
+      "ml_missing": "",
+      "chroma_ok": "YES",
+      "chroma_status": "ok_num"
+    },
+    {
+      "symbol": "GBPUSD",
+      "strategy": "ema_crossover",
+      "ml_ok": "YES",
+      "ml_missing": "",
+      "chroma_ok": "YES",
+      "chroma_status": "ok_num"
+    },
+    {
+      "symbol": "GBPUSD",
+      "strategy": "channel_reversal",
+      "ml_ok": "YES",
+      "ml_missing": "",
+      "chroma_ok": "YES",
+      "chroma_status": "ok_num"
+    },
+    {
+      "symbol": "GBPUSD",
+      "strategy": "multi_filter_scalper",
+      "ml_ok": "YES",
+      "ml_missing": "",
+      "chroma_ok": "YES",
+      "chroma_status": "ok_num"
+    },
+    {
+      "symbol": "GBPUSD",
+      "strategy": "rsi_pullback",
+      "ml_ok": "YES",
+      "ml_missing": "",
+      "chroma_ok": "YES",
+      "chroma_status": "ok_num"
+    },
+    {
+      "symbol": "GBPUSD",
+      "strategy": "volatility_breakout",
+      "ml_ok": "YES",
+      "ml_missing": "",
+      "chroma_ok": "YES",
+      "chroma_status": "ok_num"
+    },
+    {
+      "symbol": "AUDUSD",
+      "strategy": "ema_crossover",
+      "ml_ok": "YES",
+      "ml_missing": "",
+      "chroma_ok": "YES",
+      "chroma_status": "ok_num"
+    },
+    {
+      "symbol": "AUDUSD",
+      "strategy": "channel_reversal",
+      "ml_ok": "YES",
+      "ml_missing": "",
+      "chroma_ok": "YES",
+      "chroma_status": "ok_num"
+    },
+    {
+      "symbol": "AUDUSD",
+      "strategy": "multi_filter_scalper",
+      "ml_ok": "YES",
+      "ml_missing": "",
+      "chroma_ok": "YES",
+      "chroma_status": "ok_num"
+    },
+    {
+      "symbol": "AUDUSD",
+      "strategy": "rsi_pullback",
+      "ml_ok": "YES",
+      "ml_missing": "",
+      "chroma_ok": "YES",
+      "chroma_status": "ok_num"
+    },
+    {
+      "symbol": "AUDUSD",
+      "strategy": "volatility_breakout",
+      "ml_ok": "YES",
+      "ml_missing": "",
+      "chroma_ok": "YES",
+      "chroma_status": "ok_num"
+    },
+    {
+      "symbol": "USDJPY",
+      "strategy": "ema_crossover",
+      "ml_ok": "YES",
+      "ml_missing": "",
+      "chroma_ok": "YES",
+      "chroma_status": "ok_num"
+    },
+    {
+      "symbol": "USDJPY",
+      "strategy": "channel_reversal",
+      "ml_ok": "YES",
+      "ml_missing": "",
+      "chroma_ok": "YES",
+      "chroma_status": "ok_num"
+    },
+    {
+      "symbol": "USDJPY",
+      "strategy": "multi_filter_scalper",
+      "ml_ok": "YES",
+      "ml_missing": "",
+      "chroma_ok": "YES",
+      "chroma_status": "ok_num"
+    },
+    {
+      "symbol": "USDJPY",
+      "strategy": "rsi_pullback",
+      "ml_ok": "YES",
+      "ml_missing": "",
+      "chroma_ok": "YES",
+      "chroma_status": "ok_num"
+    },
+    {
+      "symbol": "USDJPY",
+      "strategy": "volatility_breakout",
+      "ml_ok": "YES",
+      "ml_missing": "",
+      "chroma_ok": "YES",
+      "chroma_status": "ok_num"
+    }
+  ],
+  "counts": {
+    "controllers": 20,
+    "ml_ok": 20,
+    "ml_missing": 0,
+    "chroma_ok": 20,
+    "chroma_missing": 0
+  }
+}

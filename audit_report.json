@@ -1,0 +1,146 @@
+{
+  "root": "E:\\Cryptos\\Advanced_Trading_Bot_V2",
+  "counts": {
+    "combos_from_global_config": 4,
+    "combos_from_optimization_studies": 0,
+    "combos_union": 4
+  },
+  "combos": [
+    {
+      "symbol": "EURUSD",
+      "strategy": "ema_crossover"
+    },
+    {
+      "symbol": "GBPUSD",
+      "strategy": "ema_crossover"
+    },
+    {
+      "symbol": "AUDUSD",
+      "strategy": "ema_crossover"
+    },
+    {
+      "symbol": "USDJPY",
+      "strategy": "ema_crossover"
+    }
+  ],
+  "models": {
+    "EURUSD:ema_crossover": {
+      "strategy_dir": "E:\\Cryptos\\Advanced_Trading_Bot_V2\\models",
+      "files": {
+        "EURUSD_confirmation_model.pkl": "",
+        "EURUSD_feature_scaler.pkl": "",
+        "EURUSD_model_features.joblib": ""
+      },
+      "missing": [
+        "EURUSD_confirmation_model.pkl",
+        "EURUSD_feature_scaler.pkl",
+        "EURUSD_model_features.joblib"
+      ]
+    },
+    "GBPUSD:ema_crossover": {
+      "strategy_dir": "E:\\Cryptos\\Advanced_Trading_Bot_V2\\models",
+      "files": {
+        "GBPUSD_confirmation_model.pkl": "",
+        "GBPUSD_feature_scaler.pkl": "",
+        "GBPUSD_model_features.joblib": ""
+      },
+      "missing": [
+        "GBPUSD_confirmation_model.pkl",
+        "GBPUSD_feature_scaler.pkl",
+        "GBPUSD_model_features.joblib"
+      ]
+    },
+    "AUDUSD:ema_crossover": {
+      "strategy_dir": "E:\\Cryptos\\Advanced_Trading_Bot_V2\\models",
+      "files": {
+        "AUDUSD_confirmation_model.pkl": "",
+        "AUDUSD_feature_scaler.pkl": "",
+        "AUDUSD_model_features.joblib": ""
+      },
+      "missing": [
+        "AUDUSD_confirmation_model.pkl",
+        "AUDUSD_feature_scaler.pkl",
+        "AUDUSD_model_features.joblib"
+      ]
+    },
+    "USDJPY:ema_crossover": {
+      "strategy_dir": "E:\\Cryptos\\Advanced_Trading_Bot_V2\\models",
+      "files": {
+        "USDJPY_confirmation_model.pkl": "",
+        "USDJPY_feature_scaler.pkl": "",
+        "USDJPY_model_features.joblib": ""
+      },
+      "missing": [
+        "USDJPY_confirmation_model.pkl",
+        "USDJPY_feature_scaler.pkl",
+        "USDJPY_model_features.joblib"
+      ]
+    }
+  },
+  "chroma": {
+    "path": "E:\\Cryptos\\Advanced_Trading_Bot_V2\\db\\chroma_db",
+    "status": "ready",
+    "combos": {
+      "EURUSD:ema_crossover": {
+        "ok": false,
+        "status": "query_error:Collection expecting embedding with dimension of 253, got 384"
+      },
+      "GBPUSD:ema_crossover": {
+        "ok": false,
+        "status": "query_error:Collection expecting embedding with dimension of 253, got 384"
+      },
+      "AUDUSD:ema_crossover": {
+        "ok": false,
+        "status": "query_error:Collection expecting embedding with dimension of 253, got 384"
+      },
+      "USDJPY:ema_crossover": {
+        "ok": false,
+        "status": "query_error:Collection expecting embedding with dimension of 253, got 384"
+      }
+    }
+  },
+  "reports": {
+    "cross_correlation_dir": {
+      "path": "E:\\Cryptos\\Advanced_Trading_Bot_V2\\reports\\cross_correlation_reports",
+      "exists": true,
+      "count_json": 1
+    },
+    "loss_reports_dir": {
+      "path": "E:\\Cryptos\\Advanced_Trading_Bot_V2\\reports\\multi_asset_loss_reports",
+      "exists": true,
+      "count_json": 0
+    },
+    "win_reports_dir": {
+      "path": "E:\\Cryptos\\Advanced_Trading_Bot_V2\\reports\\exhaustive_win_reports",
+      "exists": true,
+      "count_json": 21
+    },
+    "advanced_reports_dir": {
+      "path": "E:\\Cryptos\\Advanced_Trading_Bot_V2\\reports\\ultimate_analysis_reports_v2",
+      "exists": true,
+      "count_json": 21
+    },
+    "causal_reports_dir": {
+      "path": "E:\\Cryptos\\Advanced_Trading_Bot_V2\\reports\\causal_reports",
+      "exists": true,
+      "count_json": 1
+    },
+    "output_dir": {
+      "path": "E:\\Cryptos\\Advanced_Trading_Bot_V2\\reports",
+      "exists": true,
+      "count_json": 67
+    },
+    "causal_inputs_dir": {
+      "path": "E:\\Cryptos\\Advanced_Trading_Bot_V2\\reports\\ultimate_analysis_reports_v2\\causal_inputs",
+      "exists": true,
+      "count_trades_csv": 20
+    }
+  },
+  "scripts": {
+    "run_pipeline.py": "E:\\Cryptos\\Advanced_Trading_Bot_V2\\src\\optimization_pipeline\\run_pipeline.py",
+    "consolidate_global_insights.py": "E:\\Cryptos\\Advanced_Trading_Bot_V2\\src\\orchestrator\\consolidate_global_insights.py",
+    "backtest_ab_orchestrator.py": "E:\\Cryptos\\Advanced_Trading_Bot_V2\\src\\orchestrator\\backtest_ab_orchestrator.py",
+    "causal_trading_analyzer.py": "E:\\Cryptos\\Advanced_Trading_Bot_V2\\docs\\backups\\causal_trading_analyzer.py",
+    "main_bot.py": "E:\\Cryptos\\Advanced_Trading_Bot_V2\\main_bot.py"
+  }
+}

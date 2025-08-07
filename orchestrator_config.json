@@ -1,0 +1,66 @@
+{
+  "paths": {
+    "loss_reports_dir": "reports/exhaustive_loss_reports",
+    "win_reports_dir": "reports/exhaustive_win_reports",
+    "advanced_reports_dir": "reports/ultimate_analysis_reports_v2",
+    "cross_correlation_dir": "reports/cross_correlation_reports",
+    "causal_reports_dir": "reports/causal_reports",
+    "output_dir": "reports"
+  },
+
+  "chroma": {
+    "path": "db/chroma_db",
+    "collection": "historical_market_states",
+    "n_results": 10
+  },
+
+  "thresholds": {
+    "ml_confidence_min": 0.30,
+    "historical_prob_min": 0.30,
+    "orchestrator_score_min": 0.00,
+    "max_spread_pips": 3.0,
+    "max_atr_multiple": 4.0,
+    "dd_guard": -2000.0,
+    "pf_guard": 1.05
+  },
+
+  "sizing": {
+    "risk_per_trade_pct": 1.0,
+    "base_lots": 2,
+    "atr_scale": { "M5": 1.0 }
+  },
+
+  "exposure_limits": {
+    "max_total_positions": 6,
+    "max_symbol_positions": 2,
+    "max_direction_net_lots": 2.0
+  },
+
+  "correlation_caps": {
+    "window_bars": 288,
+    "cap_if_rho_gt": 0.85,
+    "max_simultaneous_same_direction": 2
+  },
+
+  "sessions": {
+    "london":  { "priority": 3 },
+    "newyork": { "priority": 3 },
+    "asia":    { "priority": 2 },
+    "off":     { "priority": 1 }
+  },
+
+  "filters": {
+    "use_news_filter": true,
+    "use_live_corr": true,
+    "use_causal_filter": true,
+    "causal": {
+      "enforce_regime": true,
+      "required_regime": "from_insight",
+      "min_pf_hard": 1.0,
+      "min_ate_threshold": 0.0,
+      "pf_penalty_factor": 0.8
+    }
+  },
+
+  "logging": { "level": "INFO" }
+}

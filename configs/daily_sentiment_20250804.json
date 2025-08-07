@@ -1,0 +1,34 @@
+{
+  "timestamp": "2025-08-04T08:11:10.856Z",
+  "date": "2025-08-04",
+  "pairs": {
+    "EURUSD": {
+      "bias": "short",
+      "confidence": 80,
+      "support": 1.135,
+      "resistance": 1.141,
+      "active": true
+    },
+    "GBPUSD": {
+      "bias": "short",
+      "confidence": 75,
+      "support": 1.31,
+      "resistance": 1.317,
+      "active": true
+    },
+    "AUDUSD": {
+      "bias": "short",
+      "confidence": 85,
+      "support": 0.638,
+      "resistance": 0.644,
+      "active": true
+    },
+    "USDJPY": {
+      "bias": "long",
+      "confidence": 80,
+      "support": 148.8,
+      "resistance": 149.5,
+      "active": true
+    }
+  }
+}

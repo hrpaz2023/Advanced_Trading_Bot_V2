@@ -1,0 +1,118 @@
+{
+  "AUDUSD:channel_reversal": {
+    "period": 25,
+    "std_dev": 2.575995492126976
+  },
+  "AUDUSD:ema_crossover": {
+    "fast_period": 5,
+    "slow_period": 87
+  },
+  "AUDUSD:multi_filter_scalper": {
+    "ema_fast": 6,
+    "ema_mid": 14,
+    "ema_slow": 61,
+    "rsi_len": 10,
+    "rsi_buy": 57,
+    "rsi_sell": 41,
+    "prox_pct": 2.45848695385074,
+    "pivot_lb": 3,
+    "atr_len": 15,
+    "atr_mult": 2.627120549026506
+  },
+  "AUDUSD:rsi_pullback": {
+    "rsi_level": 35,
+    "trend_ema_period": 150,
+    "rsi_period": 20
+  },
+  "AUDUSD:volatility_breakout": {
+    "period": 11,
+    "atr_period": 7
+  },
+  "EURUSD:channel_reversal": {
+    "period": 19,
+    "std_dev": 1.870716557627751
+  },
+  "EURUSD:ema_crossover": {
+    "fast_period": 5,
+    "slow_period": 34
+  },
+  "EURUSD:multi_filter_scalper": {
+    "ema_fast": 7,
+    "ema_mid": 20,
+    "ema_slow": 43,
+    "rsi_len": 14,
+    "rsi_buy": 49,
+    "rsi_sell": 38,
+    "prox_pct": 1.630137763133861,
+    "pivot_lb": 2,
+    "atr_len": 16,
+    "atr_mult": 1.9435215833392532
+  },
+  "EURUSD:rsi_pullback": {
+    "rsi_level": 28,
+    "trend_ema_period": 150,
+    "rsi_period": 21
+  },
+  "EURUSD:volatility_breakout": {
+    "period": 23,
+    "atr_period": 11
+  },
+  "GBPUSD:channel_reversal": {
+    "period": 36,
+    "std_dev": 2.433580394912366
+  },
+  "GBPUSD:ema_crossover": {
+    "fast_period": 7,
+    "slow_period": 100
+  },
+  "GBPUSD:multi_filter_scalper": {
+    "ema_fast": 16,
+    "ema_mid": 27,
+    "ema_slow": 73,
+    "rsi_len": 13,
+    "rsi_buy": 46,
+    "rsi_sell": 37,
+    "prox_pct": 1.7195777960781007,
+    "pivot_lb": 4,
+    "atr_len": 13,
+    "atr_mult": 2.651644777133285
+  },
+  "GBPUSD:rsi_pullback": {
+    "rsi_level": 20,
+    "trend_ema_period": 200,
+    "rsi_period": 8
+  },
+  "GBPUSD:volatility_breakout": {
+    "period": 23,
+    "atr_period": 9
+  },
+  "USDJPY:channel_reversal": {
+    "period": 20,
+    "std_dev": 2.0922695035007015
+  },
+  "USDJPY:ema_crossover": {
+    "fast_period": 11,
+    "slow_period": 48
+  },
+  "USDJPY:multi_filter_scalper": {
+    "ema_fast": 13,
+    "ema_mid": 26,
+    "ema_slow": 48,
+    "rsi_len": 10,
+    "rsi_buy": 63,
+    "rsi_sell": 36,
+    "prox_pct": 1.132821624575981,
+    "pivot_lb": 3,
+    "atr_len": 13,
+    "atr_mult": 2.364386356784786
+  },
+  "USDJPY:rsi_pullback": {
+    "rsi_level": 30,
+    "trend_ema_period": 150,
+    "rsi_period": 16
+  },
+  "USDJPY:volatility_breakout": {
+    "period": 26,
+    "atr_period": 17
+  }
+}

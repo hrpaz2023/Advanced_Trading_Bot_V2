@@ -1,0 +1,22 @@
+# requirements-lock.txt - pinned versions (generated 2025-08-03 14:15:37)
+# Tested combo for Python 3.10+/Linux. Adjust if your environment differs.
+
+numpy==1.26.4
+pandas==2.2.2
+scikit-learn==1.3.2
+matplotlib==3.8.4
+
+# Causal Inference
+econml==0.14.1
+dowhy==0.11.1
+
+# Utilities
+pyyaml==6.0.1
+optuna==3.6.1
+
+# Optional (recommended)
+graphviz==0.20.3
+lightgbm==4.3.0
+
+# Optional (feature importance, not used directly in pipeline)
+shap==0.44.1

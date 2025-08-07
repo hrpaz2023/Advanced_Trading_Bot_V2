@@ -1,0 +1,67 @@
+{
+  "trading_symbols": [
+    "EURUSD",
+    "GBPUSD",
+    "AUDUSD",
+    "USDJPY"
+  ],
+  "timeframe": "M5",
+  "magic_number": 202401,
+
+  "mt5_credentials": {
+    "login": 1511249527,
+    "password": "T48zJRU?6",
+    "server": "FTMO-Demo"
+  },
+
+  "trading_settings": {
+    "max_spread_pips": 3.0,
+    "slippage_points": 3,
+    "max_position_size": 5.0,
+    "default_risk_per_trade": 1.0
+  },
+
+  "symbols": {
+    "EURUSD": { "enabled": true, "pip_size": 0.0001, "pip_value": 10 },
+    "GBPUSD": { "enabled": true, "pip_size": 0.0001, "pip_value": 10 },
+    "AUDUSD": { "enabled": true, "pip_size": 0.0001, "pip_value": 10 },
+    "USDJPY": { "enabled": true, "pip_size": 0.01,   "pip_value": 9.09 }
+  },
+
+  "email_notifications": {
+    "enabled": true,
+    "smtp_server": "smtp.gmail.com",
+    "smtp_port": 587,
+    "sender_email": "hrpaz2000@gmail.com",
+    "sender_password": "poje avsk danv mrqq",
+    "receiver_email": "hrpaz2000@yahoo.com.ar"
+  },
+
+  "project_path": "/path/to/your/Advanced_Trading_Bot",
+
+  "controllers": [
+    { "symbol": "EURUSD", "strategy": "ema_crossover" },
+    { "symbol": "EURUSD", "strategy": "channel_reversal" },
+    { "symbol": "EURUSD", "strategy": "multi_filter_scalper" },
+    { "symbol": "EURUSD", "strategy": "rsi_pullback" },
+    { "symbol": "EURUSD", "strategy": "volatility_breakout" },
+
+    { "symbol": "GBPUSD", "strategy": "ema_crossover" },
+    { "symbol": "GBPUSD", "strategy": "channel_reversal" },
+    { "symbol": "GBPUSD", "strategy": "multi_filter_scalper" },
+    { "symbol": "GBPUSD", "strategy": "rsi_pullback" },
+    { "symbol": "GBPUSD", "strategy": "volatility_breakout" },
+
+    { "symbol": "AUDUSD", "strategy": "ema_crossover" },
+    { "symbol": "AUDUSD", "strategy": "channel_reversal" },
+    { "symbol": "AUDUSD", "strategy": "multi_filter_scalper" },
+    { "symbol": "AUDUSD", "strategy": "rsi_pullback" },
+    { "symbol": "AUDUSD", "strategy": "volatility_breakout" },
+
+    { "symbol": "USDJPY", "strategy": "ema_crossover" },
+    { "symbol": "USDJPY", "strategy": "channel_reversal" },
+    { "symbol": "USDJPY", "strategy": "multi_filter_scalper" },
+    { "symbol": "USDJPY", "strategy": "rsi_pullback" },
+    { "symbol": "USDJPY", "strategy": "volatility_breakout" }
+  ]
+}

@@ -1,0 +1,80 @@
+# Ignorar archivos y directorios generados / temporales
+
+# Entornos virtuales
+
+venv/
+.env/
+.venv/
+ENV/
+env/
+
+# Configuración de editor
+
+.vscode/
+
+# Byte compiled
+
+**pycache**/
+\*.py\[cod]
+\*\$py.class
+
+# Logs y historiales
+
+docs/
+data/
+reports/
+logs/
+\*.log
+\*.jsonl
+
+# Snapshots de velas
+
+data/candles/
+\*.parquet
+
+# Sistemas operativos
+
+.DS\_Store
+Thumbs.db
+ehmthumbs.db
+
+# Cache de testing y cobertura
+
+.pytest\_cache/
+.coverage
+
+# Cachés de herramientas
+
+.mypy\_cache/
+
+# Directorios de bases de datos o persistencia temporal
+
+db/
+
+# Estudios de optimización (grids, stuides auto-gen)
+
+optimization\_studies/
+
+# Modelos generados
+
+models/
+
+# Archivos web temporales
+
+web/
+
+# Archivos de build/distribution
+
+build/
+dist/
+\*.egg-info/
+\*.egg
+\*.whl
+
+# Archivos Sphinx
+
+docs/\_build/
+
+# Jupyter
+
+.ipynb\_checkpoints
