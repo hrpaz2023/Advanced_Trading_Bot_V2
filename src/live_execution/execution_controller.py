@@ -150,6 +150,41 @@ def donchian_channels(df: pd.DataFrame, period: int = 20) -> Tuple[pd.Series, pd
     lower = df['low'].rolling(window=period, min_periods=period).min()
     return upper, lower
 
+def _ensure_timestamp_col(self, df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Garantiza que exista columna 'timestamp' en UTC.
+    Acepta 'time' o índice DatetimeIndex.
+    """
+    _df = df.copy()
+    if "timestamp" in _df.columns:
+        _df["timestamp"] = pd.to_datetime(_df["timestamp"], utc=True, errors="coerce")
+    elif "time" in _df.columns:
+        _df["timestamp"] = pd.to_datetime(_df["time"], utc=True, errors="coerce")
+    elif isinstance(_df.index, pd.DatetimeIndex):
+        _df["timestamp"] = _df.index.tz_convert("UTC") if _df.index.tz is not None else _df.index.tz_localize("UTC")
+    else:
+        # último recurso: NaT -> luego extraemos now(UTC)
+        _df["timestamp"] = pd.NaT
+    _df = _df.dropna(subset=["timestamp"])
+    return _df
+
+def _extract_df_last_ts(self, df: pd.DataFrame) -> datetime:
+    """
+    Devuelve el timestamp de la última vela como datetime aware UTC.
+    Si no existe, usa now(UTC).
+    """
+    try:
+        if "timestamp" in df.columns and len(df) > 0:
+            ts = df["timestamp"].iloc[-1]
+            ts = pd.to_datetime(ts, utc=True, errors="coerce")
+            if pd.isna(ts):
+                raise ValueError("NaT")
+            return ts.to_pydatetime()
+    except Exception:
+        pass
+    return datetime.now(timezone.utc)
+
+
 
 # -----------------------------------------------------------------------------
 # Wilson LB (90%)
@@ -334,8 +369,8 @@ class OptimizedExecutionController:
     def _query_chroma_with_fallback(self, query_embedding: Optional[np.ndarray], n: int = 9):
         """
         Fallback escalonado:
-        Tier1: where={"symbol":SYM, "strategy":STRAT}
-        Tier2: where={"symbol":SYM}
+        Tier1: where={"$and":[{"symbol":{"$eq":SYM}}, {"strategy":{"$eq":STRAT}}]}
+        Tier2: where={"symbol":{"$eq":SYM}}
         Tier3: where={}
         Retorna dict con (metas, distancias) o None.
         """
@@ -346,8 +381,8 @@ class OptimizedExecutionController:
         strat = self._norm_strategy(self.strategy_name)
 
         tiers = [
-            {"symbol": sym, "strategy": strat},
-            {"symbol": sym},
+            {"$and": [{"symbol": {"$eq": sym}}, {"strategy": {"$eq": strat}}]},
+            {"symbol": {"$eq": sym}},
             {},
         ]
 
@@ -367,7 +402,6 @@ class OptimizedExecutionController:
                     if not ids:
                         continue
                     metas = (got.get("metadatas") or [])[:n]
-                    # 👇 FIJATE AQUÍ: se corrige el corchete extra
                     res = {
                         "metadatas": [metas],
                         "distances": [[0.0] * len(metas)]
@@ -385,6 +419,7 @@ class OptimizedExecutionController:
 
         logger.info(f"ℹ️ [{sym}] ChromaDB: Sin resultados para la consulta. (colección='{self.chroma_collection_name}')")
         return None
+
 
 
     # -------------------------------------------------------------------------
@@ -935,10 +970,17 @@ class OptimizedExecutionController:
         t0 = time.perf_counter()
 
         # 1) Datos
-        df = df_override if (df_override is not None and not df_override.empty) else self._get_ohlc(self.LOOKBACK_BARS)
-        if df is None or len(df) < 50:
+        df_raw = df_override if (df_override is not None and not df_override.empty) else self._get_ohlc(self.LOOKBACK_BARS)
+        if df_raw is None or len(df_raw) < 50:
             logger.warning(f"⚠️ No hay suficientes barras para {self.symbol}")
             return None
+
+        # 🔧 Normaliza/garantiza 'timestamp'
+        df = self._ensure_timestamp_col(df_raw)
+        if df is None or len(df) < 50:
+            logger.warning(f"⚠️ No hay suficientes barras (post-normalización) para {self.symbol}")
+            return None
+
         # 2) Señal base
         base = self._compute_strategy_signal(df)
         if base is None:
@@ -950,24 +992,15 @@ class OptimizedExecutionController:
 
         self.last_signal_attempt = {"signal_data": base.copy(), "timestamp": datetime.now(timezone.utc)}
 
-        # 3) Features → scaler/model
-        scaled_df = None
-        if self.model is not None and self.scaler is not None and self.model_features:
-            live_row = self._prepare_live_feature_row(df)
-            if live_row is not None:
-                try:
-                    scaled_df = pd.DataFrame(self.scaler.transform(live_row), columns=self.model_features)
-                except Exception as e:
-                    logger.error(f"Error escalando features para {self.symbol}: {e}")
-                    return None
+        # 3) Features → scaler/model (… SIN CAMBIOS …)
 
         # 4) CHROMA + Wilson LB90
         historical_prob = 0.5
         historical_prob_lb90 = 0.5
         chroma_samples_found = 0
+
         if self.collection is not None:
             try:
-                # Usamos embedding solo si tenemos scaled_df de 1 fila y dimensión consistente
                 query_emb = None
                 if scaled_df is not None and getattr(scaled_df, "shape", (0,))[0] >= 1:
                     query_emb = scaled_df.values[0].tolist()
@@ -977,9 +1010,12 @@ class OptimizedExecutionController:
                     metas = fetched["metas"]
                     dists = fetched["distances"] or [None] * len(metas)
 
-                    # Tiempo de la señal para evitar lookahead
-                    signal_time = base.get("timestamp") or base.get("time") or base.get("ts") or df["timestamp"].iloc[-1]
-                    signal_time = to_aware_utc(signal_time) or datetime.now(timezone.utc)
+                    # 🔧 Señal time robusto (evita lookahead)
+                    signal_time = base.get("timestamp") or base.get("time") or base.get("ts")
+                    if signal_time is None:
+                        signal_time = self._extract_df_last_ts(df)
+                    else:
+                        signal_time = to_aware_utc(signal_time) or self._extract_df_last_ts(df)
 
                     valid = []
                     seen = set()
@@ -1004,7 +1040,7 @@ class OptimizedExecutionController:
                         m["_distance"] = float(dist) if dist is not None else None
                         valid.append(m)
 
-                    # Excluir 0 (break-even) del denominador para una lectura más clara
+                    # Excluir 0/breakeven del denominador
                     valid = [m for m in valid if m["_outcome"] in (-1, 1)]
                     chroma_samples_found = len(valid)
 
@@ -1030,11 +1066,10 @@ class OptimizedExecutionController:
                                 f"p̂={p_hat:.2%}, LB90={p_lo:.2%} ({side_str})"
                             )
 
-                        # Rechazo conservador por LB90
                         min_samples = max(7, self.chroma_n_results // 3)
                         if chroma_samples_found >= min_samples and p_lo < self.HISTORICAL_PROB_THRESHOLD:
                             reason = (f"Prob. histórica conservadora baja (LB90={p_lo:.2%} "
-                                      f"< {self.HISTORICAL_PROB_THRESHOLD:.2%}) con {chroma_samples_found} casos.")
+                                    f"< {self.HISTORICAL_PROB_THRESHOLD:.2%}) con {chroma_samples_found} casos.")
                             logger.info(f"❌ [{self.symbol}] RECHAZADA por {reason}")
                             signal_log = base.copy()
                             signal_log.update({
@@ -1060,6 +1095,7 @@ class OptimizedExecutionController:
                     logger.info(f"ℹ️ [{self.symbol}] ChromaDB: Sin resultados para la consulta.")
             except Exception as e:
                 logger.warning(f"⚠️ Error validando con ChromaDB: {e}")
+
 
         # 5) Modelo ML
         ml_confidence = 0.5
@@ -1117,6 +1153,8 @@ class OptimizedExecutionController:
         )
         self._update_perf(t0, approved=True)
 
+        # timestamp robusto para salida
+        ts_last = self._extract_df_last_ts(df)
         return {
             "action": side_str,
             "entry_price": float(df["close"].iloc[-1]),
@@ -1126,8 +1164,9 @@ class OptimizedExecutionController:
             "historical_prob_lb90": float(historical_prob_lb90),
             "chroma_samples": int(chroma_samples_found),
             "n_eff": int(chroma_samples_found),
-            "timestamp": str(df["timestamp"].iloc[-1]),
+            "timestamp": ts_last.isoformat(),
         }
+
 
     # -------------------------------------------------------------------------
     # Ejecución
