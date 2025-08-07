@@ -1,23 +1,24 @@
-# main_bot.py — encabezado (imports principales + instancias globales)
+# main_bot.py — encabezado (imports principales + utilidades)
 # ------------------------------------------------------------------
 import os, sys, csv, time, json, signal, logging, threading
 from typing import Dict, Any, List, Optional
-from datetime import datetime as dt
+from dataclasses import dataclass, field
+
+# Tiempo / snapshots
+import datetime as dt            # (dt es el MÓDULO → usar dt.datetime.now/utcnow)
+from datetime import timezone
+from pathlib import Path
+
+# Terceros
 import pytz
-import pandas as pd  # ⇦ NUEVO
-from pathlib import Path      # ⇦ NUEVO
-import datetime as dt            # dt es el MÓDULO (dt.datetime.now/utcnow)
-from datetime import timezone    # para timezone.utc
+import pandas as pd
 
 # --- PMI ---------------------------------------------------------------------
 from pmi.smart_position_manager import SmartPositionManager
 from pmi.logger                 import log_pmi_decision
 from pmi.decision               import PMIDecision
-# (Trend-Change Detector ya estaba importado)
 from pmi.trend_change_detector  import TrendChangeDetector
 
-tcd = TrendChangeDetector()              # instancia única
-spm = SmartPositionManager()             # «modo observador»
 # -----------------------------------------------------------------------------
 
 # Zona horaria local (para logs de cuenta regresiva)
@@ -343,11 +344,13 @@ STRATEGY_MAPPING = {
 }
 
 
+# Estructura de especificación para armar controllers
 @dataclass
 class ControllerSpec:
     symbol: str
     strategy: str
     params: Dict[str, Any] = field(default_factory=dict)
+
 
 
 # ---------- BOT ----------
@@ -360,7 +363,47 @@ class OrchestratedMT5Bot:
         insights_path: str = "reports/global_insights.json",
         base_lots: float = 0.10,
         cycle_seconds: int = 30,
+        symbols: list[str] | None = None,
+        time_frame: str = "M5",
+        logger: logging.Logger | None = None,
+        # --- NUEVOS/CLAVE: pmi opcional (y compatibilidad) ---
+        pmi: SmartPositionManager | None = None,
+        trend_detector: TrendChangeDetector | None = None,
+        **kwargs,
     ):
+        """
+        Constructor. Acepta `pmi` como argumento opcional.
+        Si no se pasa, se instancia SmartPositionManager por defecto.
+        Mantiene compatibilidad por si en el código viejo existía `spm`.
+        """
+        # ---- guarda lo que ya usabas ---
+        self.logger = logger or logging.getLogger("OrchestratedMT5Bot")
+        self.symbols = symbols or ["EURUSD", "GBPUSD", "AUDUSD", "USDJPY"]
+        self.time_frame = time_frame
+
+        # ----------------- PMI -----------------
+        # 1) si te pasan un PMI explícito, úsalo
+        if pmi is not None:
+            self.pmi = pmi
+        else:
+            # 2) compatibilidad con código viejo que usaba variable local `spm`
+            try:
+                self.pmi = spm  # noqa: F821 (si no existe, salta NameError)
+            except NameError:
+                # 3) fallback por defecto: instancia uno nuevo
+                self.pmi = SmartPositionManager()
+
+        # ----------------- TCD -----------------
+        # (si en tu código usabas una variable local `tcd`, lo mismo)
+        if trend_detector is not None:
+            self.trend_change_detector = trend_detector
+        else:
+            try:
+                self.trend_change_detector = tcd  # noqa: F821
+            except NameError:
+                self.trend_change_detector = TrendChangeDetector()        
+
+
         os.environ.setdefault("OMP_NUM_THREADS", "1")
         os.environ.setdefault("MKL_NUM_THREADS", "1")
 
@@ -411,17 +454,6 @@ class OrchestratedMT5Bot:
 
         self.logger.info("✅ Bot MT5 orquestado inicializado con control de posiciones.")
         self._print_startup_summary()
-
-        # ---------- NUEVO: instancia PMI -----------------
-        self.pmi = spm
-        # Contador de decisiones PMI (útil para diagnosticar)
-        self.pmi_stats = {
-            "evaluations": 0,
-            "close_signals": 0,
-            "partial_close": 0,
-            "tighten_sl": 0,
-        }
-        # --------------------------------------------------
 
 
     def _print_startup_summary(self):
@@ -679,43 +711,49 @@ class OrchestratedMT5Bot:
 
 
     # ------------------------------------------------------------------
-    # Helper: descarga velas y guarda snapshot .parquet
+    # Helper: descarga velas y guarda snapshot .parquet  (REEMPLAZAR COMPLETO)
     # ------------------------------------------------------------------
     def _fetch_candles(self, symbol: str, timeframe: str = "M5", n: int = 400):
         """
         Devuelve un DataFrame con las últimas *n* velas del símbolo
         y guarda un snapshot de las últimas 200 en data/candles/<símbolo>/.
         """
-        if not MT5_AVAILABLE or not self.mt5_connected:
-            self.logger.warning(f"_fetch_candles: MT5 no disponible para {symbol}.")
-            return None
-
-        tf_map = {
-            "M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5,
-            "M15": mt5.TIMEFRAME_M15, "M30": mt5.TIMEFRAME_M30,
-            "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4, "D1": mt5.TIMEFRAME_D1,
-        }
-        tf_const = tf_map.get(timeframe.upper(), mt5.TIMEFRAME_M5)
-
         try:
+            if not MT5_AVAILABLE or not self.mt5_connected:
+                self.logger.warning(f"_fetch_candles: MT5 no disponible para {symbol}.")
+                return None
+
+            tf_map = {
+                "M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5,
+                "M15": mt5.TIMEFRAME_M15, "M30": mt5.TIMEFRAME_M30,
+                "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4, "D1": mt5.TIMEFRAME_D1,
+            }
+            tf_const = tf_map.get(timeframe.upper(), mt5.TIMEFRAME_M5)
+
             rates = mt5.copy_rates_from_pos(symbol, tf_const, 0, n)
-            if not rates:
+
+            # ✅ Validación segura para numpy arrays
+            if rates is None or len(rates) == 0:
                 self.logger.warning(f"_fetch_candles: sin datos para {symbol}")
                 return None
 
             df = pd.DataFrame(rates)
-            df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-            df.rename(columns={"tick_volume": "volume"}, inplace=True)
+            # normalización de columnas
+            if "time" in df.columns:
+                df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+            if "tick_volume" in df.columns:
+                df.rename(columns={"tick_volume": "volume"}, inplace=True)
 
             # ---------- Snapshot ----------
             try:
-                ts = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                ts = dt.datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")  # ← sin utcnow()
                 out_dir = Path("data") / "candles" / symbol
                 out_dir.mkdir(parents=True, exist_ok=True)
                 out_file = out_dir / f"{symbol}_{ts}.parquet"
                 df.tail(200).to_parquet(out_file, index=False)
                 self.logger.debug(f"Snapshot velas {symbol} → {out_file}")
             except Exception as e:
+                # no interrumpir si falla sólo el snapshot
                 self.logger.warning(f"No pude guardar snapshot velas {symbol}: {e}")
             # ------------------------------
 
@@ -724,6 +762,8 @@ class OrchestratedMT5Bot:
         except Exception as e:
             self.logger.error(f"_fetch_candles: error copiando velas {symbol}: {e}")
             return None
+
+
 
     # ------------------------------------------------------------------
     # PMI – evaluación en modo observador
@@ -843,20 +883,25 @@ class OrchestratedMT5Bot:
                         if df is None or df.empty:
                             continue
 
-                        # ─── ② Trend-Change Detector (PASO B) ───
-                        tcd_out = tcd.estimate_probability(df)
-                        prob_tc  = float(tcd_out.get("probability", 0.0))
-                        details  = tcd_out.get("details", {})
+                        # --- Trend-Change Detector (TCD) ---
+                        try:
+                            tcd_out = self.trend_change_detector.estimate_probability(df)  # ← usa el atributo de la clase
+                            prob_tc = float(tcd_out.get("probability", 0.0))
+                            tcd_details = {k: v for k, v in tcd_out.items() if k != "probability"}
+                            # Log opcional
+                            self.logger.info(f"[{c.symbol}] TCD prob={prob_tc:.3f} details={tcd_details}")
+                        except Exception as e:
+                            self.logger.warning(f"[{c.symbol}] TCD error: {e}")
+                            prob_tc = 0.0
+                            tcd_details = {}
 
-                        # Guarda por si quieres pasarlo al controller o al logger
-                        extra_context = {
-                            "trend_change_prob": prob_tc,
-                            "trend_details": details,
-                        }
+                        # enriquecer el contexto que pasas a la señal / PMI
+                        extra_context = extra_context if 'extra_context' in locals() else {}
+                        extra_context.update({
+                            "tcd_prob": prob_tc,
+                            "tcd": tcd_details,
+                        })
 
-                        self.logger.debug(
-                            f"[PMI-TCD] {c.symbol} prob_giro={prob_tc:.2f}  detalles={details}"
-                        )
 
                         # ─── ③ Resto de tu flujo habitual ───
                         signal_result = c.get_trading_signal_with_details(
