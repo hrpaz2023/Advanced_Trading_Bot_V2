@@ -354,6 +354,7 @@ class ControllerSpec:
 
 
 # ---------- BOT ----------
+# ---------- BOT ----------
 class OrchestratedMT5Bot:
     def __init__(
         self,
@@ -366,92 +367,64 @@ class OrchestratedMT5Bot:
         symbols: list[str] | None = None,
         time_frame: str = "M5",
         logger: logging.Logger | None = None,
-        # --- NUEVOS/CLAVE: pmi opcional (y compatibilidad) ---
+        # --- PMI opcional ---
         pmi: SmartPositionManager | None = None,
         trend_detector: TrendChangeDetector | None = None,
-        self.pmi_active = kwargs.get("pmi_active", False)   # False = observador
-        self.pmi_partial_close_ratio = kwargs.get("pmi_partial_close_ratio", 0.5)
+        # --- Flags PMI ---
+        pmi_active: bool = False,
+        pmi_partial_close_ratio: float = 0.5,
+        pmi_active_symbols: Optional[List[str]] | None = None,
         **kwargs,
     ):
-        """
-        Constructor. Acepta `pmi` como argumento opcional.
-        Si no se pasa, se instancia SmartPositionManager por defecto.
-        Mantiene compatibilidad por si en el código viejo existía `spm`.
-        """
-        # ---- guarda lo que ya usabas ---
-        self.logger = logger or logging.getLogger("OrchestratedMT5Bot")
-        self.symbols = symbols or ["EURUSD", "GBPUSD", "AUDUSD", "USDJPY"]
-        self.time_frame = time_frame
-
-        # ----------------- PMI -----------------
-        # 1) si te pasan un PMI explícito, úsalo
-        if pmi is not None:
-            self.pmi = pmi
-        else:
-            # 2) compatibilidad con código viejo que usaba variable local `spm`
-            try:
-                self.pmi = spm  # noqa: F821 (si no existe, salta NameError)
-            except NameError:
-                # 3) fallback por defecto: instancia uno nuevo
-                self.pmi = SmartPositionManager()
-
-        # ----------------- TCD -----------------
-        # (si en tu código usabas una variable local `tcd`, lo mismo)
-        if trend_detector is not None:
-            self.trend_change_detector = trend_detector
-        else:
-            try:
-                self.trend_change_detector = tcd  # noqa: F821
-            except NameError:
-                self.trend_change_detector = TrendChangeDetector()        
-
-
+        """Constructor con soporte PMI opcional."""
         os.environ.setdefault("OMP_NUM_THREADS", "1")
         os.environ.setdefault("MKL_NUM_THREADS", "1")
 
-        self.logger = setup_logging()
+        # Logger
+        self.logger = logger or setup_logging()
+
+        # Config básicos
+        self.symbols = symbols or ["EURUSD", "GBPUSD", "AUDUSD", "USDJPY"]
+        self.time_frame = time_frame
         self.base_lots = base_lots
         self.cycle_seconds = cycle_seconds
         self.stop_event = threading.Event()
 
-        # Estadísticas del bot (ampliadas)
+        # PMI / TCD
+        self.pmi = pmi or SmartPositionManager()
+        self.trend_change_detector = trend_detector or TrendChangeDetector()
+
+        # Flags PMI
+        self.pmi_active = bool(pmi_active)                      # False = observador
+        self.pmi_partial_close_ratio = float(pmi_partial_close_ratio)
+        self.pmi_active_symbols = set(pmi_active_symbols or []) # whitelist
+
+        # Stats
         self.stats = {
             "signals_generated": 0,
             "signals_approved": 0,
             "signals_rejected": 0,
             "signals_executed": 0,
-            "signals_blocked_by_position": 0,  # NUEVA ESTADÍSTICA
+            "signals_blocked_by_position": 0,
             "news_blocks": 0,
-            "execution_errors": 0
+            "execution_errors": 0,
         }
+        self.pmi_stats = {"evaluations": 0, "close": 0, "partial_close": 0, "tighten_sl": 0}
 
-        # 1) Configs
+        # Carga de configs y setup de subsistemas (ajusta según tus helpers)
         self.global_cfg = self._load_json(config_path, "global_config")
         self.risk_cfg = self._load_json(risk_path, "risk_config")
         self.timeframe = self.global_cfg.get("timeframe", "M5")
 
-        # 2) Notifier
         self.notifier = self._setup_notifier()
-
-        # 3) News filter (opcional)
         self.news_filter = self._setup_news_filter()
 
-        # 4) MT5 (si aplica)
         self.mt5_connected = init_mt5_from_config(self.global_cfg, self.logger)
-
-        # 5) TradingClient
         self.client = self._setup_trading_client()
 
-        # 6) Policy switcher
         self.policy = PolicySwitcher(config_path=orch_cfg_path, global_insights_path=insights_path)
-
-        # 7) Controllers
         self.controllers = self._build_controllers()
-
-        # 8) Cycle manager
         self.cycle_mgr = OptimizedM5CycleManager()
-
-        # 9) Señales del sistema
         self._setup_signals()
 
         self.logger.info("✅ Bot MT5 orquestado inicializado con control de posiciones.")
@@ -711,6 +684,55 @@ class OrchestratedMT5Bot:
 
         self.logger.info("📊 Estadísticas por controller:\n" + "\n".join(lines))
 
+    # --- Helpers de sizing y redondeo por bróker ---
+    def _get_broker_volume_specs(self, symbol: str):
+        try:
+            import MetaTrader5 as mt5
+            si = mt5.symbol_info(symbol)
+            if si:
+                return float(si.volume_min), float(si.volume_max), float(si.volume_step)
+        except Exception:
+            pass
+        # Defaults típicos para FX
+        return 0.01, 100.0, 0.01
+
+    def _round_volume(self, vol: float, step: float) -> float:
+        # round hacia abajo al múltiplo del step
+        return max(step, (int(vol / step)) * step)
+
+    def _compute_lot_size(self, symbol: str, atr_value: float | None = None) -> float:
+        """Devuelve el tamaño final a enviar al bróker."""
+        # 1) base_lots desde orchestrator_config o desde el parámetro del bot
+        sizing_cfg = self.orchestrator_config.get("sizing", {})
+        base_lots_cfg = float(sizing_cfg.get("base_lots", self.base_lots))
+        method = (self.risk_cfg.get("position_sizing_method") or "fixed").lower()
+
+        lots = base_lots_cfg
+        if method == "fixed":
+            lots = base_lots_cfg
+        else:
+            # atr_based (y otros) — si no tenés stop/ATR claro, no subestimes: usa al menos base_lots
+            lots = max(base_lots_cfg, lots)
+
+        # 2) recortes por límites locales
+        max_local = float(self.global_cfg.get("trading_settings", {}).get("max_position_size", 100.0))
+        lots = min(lots, max_local)
+
+        # 3) recortes por exposición direccional si lo tienes activo
+        exp_cfg = self.orchestrator_config.get("exposure_limits", {})
+        max_dir_net = float(exp_cfg.get("max_direction_net_lots", 999.0))
+        # Nota: si ya controlas net exposure fuera, podés omitir este recorte aquí
+
+        # 4) Ajuste al step del bróker
+        vmin, vmax, vstep = self._get_broker_volume_specs(symbol)
+        lots = min(vmax, max(vmin, lots))
+        lots = self._round_volume(lots, vstep)
+
+        # Log visible
+        self.logger.info(f"📏 Sizing {symbol}: method={method} base={base_lots_cfg} → lots_final={lots} (step={vstep}, min={vmin}, max={vmax})")
+        return lots
+
+
 
     # ------------------------------------------------------------------
     # Helper: descarga velas y guarda snapshot .parquet  (REEMPLAZAR COMPLETO)
@@ -807,10 +829,7 @@ class OrchestratedMT5Bot:
     # PMI: aplicar decisión (modo activo opcional)
     # ------------------------------------------------------------------
     def _apply_pmi_decision(self, decision: "PMIDecision", position: dict) -> None:
-        """
-        Mapea la decisión del PMI a acciones reales.
-        Requiere que self.pmi_active sea True para ejecutar.
-        """
+
         if not getattr(self, "pmi_active", False):
             return  # modo observador
 
@@ -818,35 +837,43 @@ class OrchestratedMT5Bot:
         ticket = int(decision.ticket)
         symbol = str(position.get("symbol"))
         volume = float(position.get("volume", 0.0))
-
-        # ratios/parametría
         partial_ratio = getattr(self, "pmi_partial_close_ratio", 0.5)
 
+        # Whitelist (piloto)
+        wl = getattr(self, "pmi_active_symbols", set())
+        if wl and symbol not in wl:
+            self.logger.info(f"PMI: {symbol} fuera de whitelist, acción={action} omitida")
+            return
+
+        # Umbral de seguridad
+        close_score = float(getattr(decision, "close_score", 0.0))
+        if action in ("CLOSE", "PARTIAL_CLOSE", "TIGHTEN_SL") and close_score < 0.92:
+            self.logger.info(f"PMI: score {close_score:.3f} < 0.92, omito acción {action} ({symbol})")
+            return
+
         try:
+            tc = getattr(self, "trading_client", None) or getattr(self, "client", None)
+
             if action == "CLOSE":
-                # cierra todo
-                if hasattr(self, "trading_client") and hasattr(self.trading_client, "close_position"):
-                    self.trading_client.close_position(ticket=ticket)
+                if tc and hasattr(tc, "close_position"):
+                    tc.close_position(ticket=ticket)
                     self.logger.info(f"PMI: CLOSE ejecutado ticket={ticket} ({symbol})")
+
             elif action == "PARTIAL_CLOSE":
                 vol_to_close = max(0.0, round(volume * partial_ratio, 2))
-                if vol_to_close > 0 and hasattr(self.trading_client, "partial_close"):
-                    self.trading_client.partial_close(ticket=ticket, volume=vol_to_close)
+                if vol_to_close > 0 and tc and hasattr(tc, "partial_close"):
+                    tc.partial_close(ticket=ticket, volume=vol_to_close)
                     self.logger.info(f"PMI: PARTIAL_CLOSE {vol_to_close} lotes ticket={ticket} ({symbol})")
+
             elif action == "TIGHTEN_SL":
-                # ejemplo básico: mover SL a break-even si existe API
-                if hasattr(self.trading_client, "move_stop_to_be"):
-                    self.trading_client.move_stop_to_be(ticket=ticket)
+                if tc and hasattr(tc, "move_stop_to_be"):
+                    tc.move_stop_to_be(ticket=ticket)
                     self.logger.info(f"PMI: TIGHTEN_SL → BE ticket={ticket} ({symbol})")
-            # HOLD no hace nada
+
+            # HOLD → no-op
         except Exception as e:
             self.logger.error(f"PMI: error aplicando acción {action} ticket={ticket}: {e}")
-
-        # --- Paso PMI por ciclo (observer/activo) ---
-        try:
-            self._pmi_integration_step(candles_by_symbol)
-        except Exception as e:
-            self.logger.error(f"PMI step error: {e}")    
+  
 
     # ------------------------------------------------------------------
     # PMI: paso de integración por ciclo
@@ -914,13 +941,13 @@ class OrchestratedMT5Bot:
         """
         Recorre las posiciones abiertas (PolicySwitcher + MT5),
         genera decisiones PMI y las registra en logs/pmi_decisions.jsonl.
-        No ejecuta órdenes todavía.
+        No ejecuta órdenes (modo observador).
         """
         try:
             # 1) Recopilar posiciones (broker y PolicySwitcher)
             open_pos: List[Dict[str, Any]] = []
 
-            # a) MT5 (si hay conexión)
+            # a) MT5
             if MT5_AVAILABLE and self.mt5_connected:
                 try:
                     mt5_pos = mt5.positions_get()
@@ -929,14 +956,14 @@ class OrchestratedMT5Bot:
                             "ticket":   int(p.ticket),
                             "symbol":   p.symbol,
                             "type":     "BUY" if p.type == 0 else "SELL",
-                            "volume":   p.volume,
-                            "price":    p.price_open,
-                            "open_time": p.time,
+                            "volume":   float(p.volume),
+                            "price":    float(p.price_open),
+                            "open_time": int(p.time),
                         })
                 except Exception as e:
                     self.logger.debug(f"PMI: error leyendo posiciones MT5: {e}")
 
-            # b) PolicySwitcher (si dispone de open_positions)
+            # b) PolicySwitcher (si expone open_positions)
             try:
                 if hasattr(self.policy, "open_positions"):
                     for t, pos in self.policy.open_positions.items():
@@ -950,21 +977,18 @@ class OrchestratedMT5Bot:
             if not open_pos:
                 return
 
-            # 2) Snapshot de mercado mínimo (solo ASK/BID o último close)
-            #    → ejemplo: {'EURUSD': {'close': 1.0967, 'atr': 0.0009}, …}
-            #    aquí simplificamos con close dummy = price
-            market_snap = {p["symbol"]: {"close": p["price"]} for p in open_pos}
+            # 2) Snapshot mínimo (a falta de último close real)
+            market_snap = {p["symbol"]: {"close": p.get("price", 0.0)} for p in open_pos}
 
             # 3) Evaluar con PMI
             decisions = self.pmi.evaluate(open_pos, market_snap) or []
             self.pmi_stats["evaluations"] += 1
 
-            # 4) Registrar
+            # 4) Registrar decisiones (usa el dataclass, no __dict__)
             for dec in decisions:
-                assert isinstance(dec, PMIDecision)
                 if dec.action.name in ("CLOSE", "PARTIAL_CLOSE", "TIGHTEN_SL"):
                     self.pmi_stats[dec.action.name.lower()] += 1
-                ok = log_pmi_decision(dec.__dict__)
+                ok = log_pmi_decision(dec)
                 if not ok:
                     self.logger.warning("PMI: no pude guardar decisión en jsonl")
 
@@ -1008,11 +1032,17 @@ class OrchestratedMT5Bot:
         self.logger.info("🚀 Iniciando loop principal (CycleManager M5 + Control de Posiciones)...")
         while not self.stop_event.is_set():
             try:
+                # Evaluación rápida (observador) al inicio del ciclo
                 self._evaluate_open_positions()
+
                 plan = self.cycle_mgr.get_cycle_plan(self.controllers)
                 if plan["action"] == "analyze_new_candle":
                     controllers_to_process = plan["controllers_to_process"]
                     t_cycle_start = time.perf_counter()
+
+                    # Donde juntamos las velas para el PMI
+                    candles_by_symbol: Dict[str, pd.DataFrame] = {}
+
                     for c in controllers_to_process:
                         t0 = time.perf_counter()
                         had_signal = False
@@ -1020,68 +1050,46 @@ class OrchestratedMT5Bot:
                         position_blocked = False
                         news_blocked = False
 
-                            # ─── ① Descarga las 400 velas que ya usas ───
+                        # ① Descargar velas
                         df = self._fetch_candles(c.symbol, timeframe="M5", n=400)
                         if df is None or df.empty:
                             continue
+                        candles_by_symbol[c.symbol] = df
 
-                        # --- Trend-Change Detector (TCD) ---
+                        # ② TCD (trend change)
                         try:
-                            tcd_out = self.trend_change_detector.estimate_probability(df)  # ← usa el atributo de la clase
+                            tcd_out = self.trend_change_detector.estimate_probability(df)
                             prob_tc = float(tcd_out.get("probability", 0.0))
                             tcd_details = {k: v for k, v in tcd_out.items() if k != "probability"}
-                            # Log opcional
                             self.logger.info(f"[{c.symbol}] TCD prob={prob_tc:.3f} details={tcd_details}")
                         except Exception as e:
                             self.logger.warning(f"[{c.symbol}] TCD error: {e}")
                             prob_tc = 0.0
                             tcd_details = {}
 
-                        # enriquecer el contexto que pasas a la señal / PMI
-                        extra_context = extra_context if 'extra_context' in locals() else {}
-                        extra_context.update({
+                        # ③ Señal + contexto extra
+                        extra_context = {
                             "tcd_prob": prob_tc,
                             "tcd": tcd_details,
-                        })
-
-
-                        # ─── ③ Resto de tu flujo habitual ───
-                        signal_result = c.get_trading_signal_with_details(
-                            df,
-                            extra_context=extra_context  # solo si tu controller acepta extras
-                        )
+                        }
+                        signal_result = c.get_trading_signal_with_details(df, extra_context=extra_context)
                         if not signal_result:
                             continue
-                        
+
                         try:
-                            # 🔧 NUEVO: Usar método mejorado con detalles completos
-                            signal_result = None
-                            if hasattr(c, 'get_trading_signal_with_details'):
-                                signal_result = c.get_trading_signal_with_details()
-                            else:
-                                # Fallback al método original
-                                signal_data = c.get_trading_signal()
-                                if signal_data:
-                                    signal_result = {'signal': signal_data, 'rejection_reason': None, 'status': 'generated'}
+                            signal_data = signal_result["signal"]
 
-                            if not signal_result:
-                                continue
-                           
-                            signal_data = signal_result['signal']
-
-                            # ───────────────────────── FILTRO POSICIÓN ABIERTA  ─────────────────────────
+                            # ───────── Filtro posición abierta (bot-level) ─────────
                             if not self._verify_no_existing_position(c.symbol):
-                                # ❶ Marca la señal como bloqueada, pero conserva TODOS los campos
                                 signal_data["status"] = "blocked_position"
                                 signal_data["rejection_reason"] = "Open position"
 
-                                # ❷ Registra el evento con todos los datos útiles
-                                _augment_log_with_extras(signal_data, signal_data)   # copia extras si faltan
+                                _augment_log_with_extras(signal_data, signal_data)
                                 log_signal_for_backtest({
                                     "timestamp_utc": safe_now_utc().isoformat(),
                                     "symbol": c.symbol,
                                     "strategy": c.strategy_name,
-                                    "side": signal_data["action"],          # BUY / SELL real
+                                    "side": signal_data["action"],
                                     "entry_price": signal_data["entry_price"],
                                     "atr": signal_data.get("atr", 0.0),
                                     "ml_confidence": signal_data.get("confidence", 0.0),
@@ -1091,73 +1099,34 @@ class OrchestratedMT5Bot:
                                     "status": "blocked_position",
                                     "rejection_reason": "Open position",
                                     "position_size": 0,
-                                    "ticket": ""
+                                    "ticket": "",
                                 })
-
-                                # ❸ Estadística y salida por consola
-                                self.stats['signals_blocked_by_position'] += 1
+                                self.stats["signals_blocked_by_position"] += 1
                                 print(format_signal_output(
                                     c.symbol, c.strategy_name, signal_data,
                                     verdict=None, execution_result=None,
                                     position_blocked=True
                                 ))
-                                continue           # <── NO pasa a policy / ejecución
-                            # ─────────────────────────────────────────────────────────────────────────────
+                                continue
+                            # ──────────────────────────────────────────────────────
 
-                            rejection_reason = signal_result.get('rejection_reason')
-                            status = signal_result.get('status', 'unknown')
-                            
-                            # 🔧 CONTADOR: SIEMPRE contar como señal si hay datos básicos
-                            if signal_data and signal_data.get('action'):
+                            rejection_reason = signal_result.get("rejection_reason")
+                            status = signal_result.get("status", "unknown")
+
+                            if signal_data and signal_data.get("action"):
                                 had_signal = True
-                                self.stats['signals_generated'] += 1
-                                
-                                # Si fue rechazada por el controller, procesarla y continuar
-                                if status == 'rejected' and rejection_reason:
-                                    self.stats['signals_rejected'] += 1
-                                    
-                                    # El logging ya se hizo en el controller, solo mostrar output
+                                self.stats["signals_generated"] += 1
+
+                                if status == "rejected" and rejection_reason:
+                                    self.stats["signals_rejected"] += 1
                                     output = format_signal_output(
-                                        c.symbol, 
-                                        c.strategy_name, 
-                                        signal_data,
-                                        verdict={'approved': False, 'reason': rejection_reason}
+                                        c.symbol, c.strategy_name, signal_data,
+                                        verdict={"approved": False, "reason": rejection_reason}
                                     )
                                     print(output)
                                     continue
 
-                            # Verificar si la señal fue bloqueada por posición (detección alternativa)
-                            if (signal_data and signal_data.get('action') and 
-                                not signal_data.get('confidence') and 
-                                status != 'rejected'):
-                                position_blocked = True
-                                self.stats['signals_blocked_by_position'] += 1
-                                
-                                log_data = {
-                                    "timestamp_utc": safe_now_utc().isoformat(),
-                                    "symbol": c.symbol,
-                                    "strategy": c.strategy_name,
-                                    "side": signal_data.get("action"),
-                                    "entry_price": signal_data.get("entry_price"),
-                                    "atr": signal_data.get("atr", 0.0),
-                                    "ml_confidence": 0.0,
-                                    "historical_prob": 0.0,
-                                    "pnl": "",
-                                    "status": "position_blocked",
-                                    "rejection_reason": "Posición existente detectada en controller (fallback)",
-                                    "position_size": 0,
-                                    "ticket": ""
-                                }
-                                _augment_log_with_extras(log_data, signal_data)
-                                log_saved = log_signal_for_backtest(log_data)
-                                if not log_saved:
-                                    self.logger.warning(f"⚠️ No se pudo guardar log inicial para {c.symbol}")
-                                
-                                output = format_signal_output(c.symbol, c.strategy_name, signal_data,
-                                                            position_blocked=True)
-                                print(output)
-                                
-                            # Log inicial de señal generada (para señales que llegan hasta aquí)
+                            # Log inicial (señales que avanzan)
                             log_data = {
                                 "timestamp_utc": safe_now_utc().isoformat(),
                                 "symbol": c.symbol,
@@ -1177,13 +1146,13 @@ class OrchestratedMT5Bot:
                                 "status": "generated",
                                 "rejection_reason": "",
                                 "position_size": 0,
-                                "ticket": ""
+                                "ticket": "",
                             }
                             _augment_log_with_extras(log_data, signal_data)
                             log_saved = log_signal_for_backtest(log_data)
                             if not log_saved:
                                 self.logger.warning(f"⚠️ No se pudo guardar log inicial para {c.symbol}")
-                            
+
                             # Policy approval
                             payload = {
                                 "atr": float(signal_data.get("atr", 0.0) or 0.0),
@@ -1195,24 +1164,24 @@ class OrchestratedMT5Bot:
                             verdict = self.policy.approve_signal(
                                 c.symbol, c.strategy_name, signal_data["action"], payload
                             )
-                            
+
                             execution_result = None
                             if verdict["approved"] and verdict["position_size"] > 0:
-                                self.stats['signals_approved'] += 1
+                                self.stats["signals_approved"] += 1
                                 log_data.update({
                                     "status": "approved",
                                     "rejection_reason": "",
-                                    "position_size": verdict["position_size"]
+                                    "position_size": verdict["position_size"],
                                 })
                                 log_signal_for_backtest(log_data)
-                                
-                                # 🔒 VERIFICACIÓN FINAL ANTES DE EJECUCIÓN
+
+                                # Verificación final anti-doble posición
                                 if not self._verify_no_existing_position(c.symbol):
                                     self.logger.error(f"🔒 [{c.symbol}] EJECUCIÓN CANCELADA: Posición detectada en verificación final")
-                                    self.stats['signals_blocked_by_position'] += 1
+                                    self.stats["signals_blocked_by_position"] += 1
                                     log_data.update({
                                         "status": "position_blocked",
-                                        "rejection_reason": "Posición existente (verificación final)"
+                                        "rejection_reason": "Posición existente (verificación final)",
                                     })
                                     log_signal_for_backtest(log_data)
                                     continue
@@ -1221,16 +1190,14 @@ class OrchestratedMT5Bot:
                                 execution_result = res
                                 if res and res.get("ticket"):
                                     confirmed = True
-                                    self.stats['signals_executed'] += 1
+                                    self.stats["signals_executed"] += 1
                                     ticket = res["ticket"]
                                     log_data.update({
                                         "status": "executed",
-                                        "ticket": ticket
+                                        "ticket": ticket,
                                     })
                                     log_signal_for_backtest(log_data)
-                                    self.policy.register_open(
-                                        ticket, c.symbol, signal_data["action"], verdict["position_size"]
-                                    )
+                                    self.policy.register_open(ticket, c.symbol, signal_data["action"], verdict["position_size"])
                                     if self.notifier:
                                         try:
                                             self.notifier.send(
@@ -1246,28 +1213,36 @@ class OrchestratedMT5Bot:
                                                     f"Price: {signal_data['entry_price']}\nATR: {signal_data.get('atr')}",
                                                 )
                                 else:
-                                    self.stats['execution_errors'] += 1
+                                    self.stats["execution_errors"] += 1
                                     log_data.update({
                                         "status": "execution_failed",
-                                        "rejection_reason": res.get('error', 'Error de ejecución desconocido') if res else 'Sin respuesta del broker'
+                                        "rejection_reason": res.get("error", "Error de ejecución desconocido") if res else "Sin respuesta del broker",
                                     })
                                     log_signal_for_backtest(log_data)
                             else:
-                                self.stats['signals_rejected'] += 1
+                                self.stats["signals_rejected"] += 1
                                 log_data.update({
                                     "status": "rejected",
-                                    "rejection_reason": verdict.get('reason', 'Criterios no cumplidos'),
-                                    "position_size": verdict.get('position_size', 0)
+                                    "rejection_reason": verdict.get("reason", "Criterios no cumplidos"),
+                                    "position_size": verdict.get("position_size", 0),
                                 })
                                 log_signal_for_backtest(log_data)
-                            
-                            output = format_signal_output(c.symbol, c.strategy_name, signal_data,
-                                                        verdict, execution_result, news_blocked, position_blocked)
+
+                            output = format_signal_output(
+                                c.symbol, c.strategy_name, signal_data,
+                                verdict, execution_result, news_blocked, position_blocked
+                            )
                             print(output)
 
                         finally:
                             proc_time = time.perf_counter() - t0
                             self.cycle_mgr.update_controller_metrics(c, proc_time, had_signal, confirmed)
+
+                    # --- PMI integration step (usa las velas ya descargadas) ---
+                    try:
+                        self._pmi_integration_step(candles_by_symbol)
+                    except Exception as e:
+                        self.logger.error(f"PMI step error: {e}")
 
                     cycle_time = time.perf_counter() - t_cycle_start
                     summary_msg = (f"🔄 Ciclo completado: {len(controllers_to_process)} controllers en {cycle_time:.2f}s "
@@ -1278,17 +1253,17 @@ class OrchestratedMT5Bot:
                                 f"(plan={plan.get('reason')})")
                     self.logger.info(summary_msg)
 
-                    # ⏱ Cuenta regresiva hasta la próxima verificación (UTC y Local)
+                    # Cuenta regresiva (usar dt.datetime)
                     next_at = plan.get("next_check_at")
                     if next_at:
                         try:
-                            target = datetime.fromisoformat(next_at)
-                            nowu = datetime.now(timezone.utc)
+                            target = dt.datetime.fromisoformat(next_at)
+                            nowu = dt.datetime.now(timezone.utc)
                             delta = target - nowu
                             total = max(0, int(delta.total_seconds()))
                             mm, ss = divmod(total, 60)
                             hh, mm = divmod(mm, 60)
-                            local_str = target.astimezone(local_tz).strftime('%H:%M:%S')
+                            local_str = target.astimezone(local_tz).strftime("%H:%M:%S")
                             self.logger.info(
                                 f"⏱ Próxima verificación en {hh:02d}:{mm:02d}:{ss:02d} "
                                 f"(UTC {target.strftime('%H:%M:%S')} | Local {local_str})"
@@ -1305,17 +1280,17 @@ class OrchestratedMT5Bot:
                                 f"Pos❌:{self.stats['signals_blocked_by_position']}")
                     self.logger.info(wait_msg)
 
-                    # ⏱ Cuenta regresiva también durante la espera
+                    # Cuenta regresiva (usar dt.datetime)
                     next_at = plan.get("next_check_at")
                     if next_at:
                         try:
-                            target = datetime.fromisoformat(next_at)
-                            nowu = datetime.now(timezone.utc)
+                            target = dt.datetime.fromisoformat(next_at)
+                            nowu = dt.datetime.now(timezone.utc)
                             delta = target - nowu
                             total = max(0, int(delta.total_seconds()))
                             mm, ss = divmod(total, 60)
                             hh, mm = divmod(mm, 60)
-                            local_str = target.astimezone(local_tz).strftime('%H:%M:%S')
+                            local_str = target.astimezone(local_tz).strftime("%H:%M:%S")
                             self.logger.info(
                                 f"⏱ Próxima verificación en {hh:02d}:{mm:02d}:{ss:02d} "
                                 f"(UTC {target.strftime('%H:%M:%S')} | Local {local_str})"
@@ -1326,9 +1301,11 @@ class OrchestratedMT5Bot:
                     time.sleep(max(1, int(plan["wait_seconds"])))
                 else:
                     time.sleep(self.cycle_seconds)
+
             except Exception as e:
                 self.logger.exception(f"❌ Error en loop principal: {e}")
                 time.sleep(max(5, self.cycle_seconds))
+
         shutdown_mt5(self.logger)
         self._print_final_stats()
         self.logger.info("🛑 Bot detenido correctamente.")

@@ -334,9 +334,9 @@ class OptimizedExecutionController:
     def _query_chroma_with_fallback(self, query_embedding: Optional[np.ndarray], n: int = 9):
         """
         Fallback escalonado:
-          Tier1: where={"symbol":SYM, "strategy":STRAT}
-          Tier2: where={"symbol":SYM}
-          Tier3: where={}
+        Tier1: where={"symbol":SYM, "strategy":STRAT}
+        Tier2: where={"symbol":SYM}
+        Tier3: where={}
         Retorna dict con (metas, distancias) o None.
         """
         if self.collection is None:
@@ -361,13 +361,17 @@ class OptimizedExecutionController:
                         include=["metadatas", "distances"],
                     )
                 else:
+                    # Fallback sin embedding: obtener por metadatos y truncar a n
                     got = self.collection.get(where=where)
                     ids = (got.get("ids") or [])
                     if not ids:
                         continue
-                    metas = got.get("metadatas") or []
-                    metas = metas[:n]
-                    res = {"metadatas": [metas], "distances": [[0.0] * len(metas)]]  # sin dist real
+                    metas = (got.get("metadatas") or [])[:n]
+                    # 👇 FIJATE AQUÍ: se corrige el corchete extra
+                    res = {
+                        "metadatas": [metas],
+                        "distances": [[0.0] * len(metas)]
+                    }
 
                 metas = (res.get("metadatas") or [[]])[0]
                 if not metas:
@@ -381,6 +385,7 @@ class OptimizedExecutionController:
 
         logger.info(f"ℹ️ [{sym}] ChromaDB: Sin resultados para la consulta. (colección='{self.chroma_collection_name}')")
         return None
+
 
     # -------------------------------------------------------------------------
     # Posiciones abiertas
