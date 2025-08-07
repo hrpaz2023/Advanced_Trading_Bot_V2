@@ -1,21 +1,24 @@
-# ------------------------------------------------------------
 # File: pmi/correlation_engine.py
-# ------------------------------------------------------------
 """Cálculo de correlaciones y detección de divergencias."""
 
 from __future__ import annotations
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 from collections import deque
-from typing import Dict, Deque
+from typing import Dict, Deque, List
 
 
 class CorrelationEngine:
-    """Mantiene buffers de precios y calcula correlaciones rolling."""
+    """
+    Mantiene buffers de precios y calcula correlaciones rolling.
+    También estima un "divergence_score" normalizado (0-1) por símbolo,
+    útil como factor para el cierre de posiciones.
+    """
 
-    def __init__(self, window: int = 400):
+    def __init__(self, window: int = 400, min_samples: int = 60):
         self.window = window
+        self.min_samples = min_samples
         self._buffers: Dict[str, Deque[float]] = {}
 
     # --------------------------------------------------
@@ -24,34 +27,80 @@ class CorrelationEngine:
     def update(self, symbol: str, close_price: float) -> None:
         """Añade un nuevo precio de cierre al buffer del símbolo."""
         buf = self._buffers.setdefault(symbol, deque(maxlen=self.window))
-        buf.append(close_price)
+        buf.append(float(close_price))
 
     # --------------------------------------------------
     # Analysis helpers
     # --------------------------------------------------
-    def _compute_corr(self, s1: str, s2: str) -> float | None:
-        b1, b2 = self._buffers.get(s1), self._buffers.get(s2)
-        if b1 is None or b2 is None or len(b1) < 30 or len(b2) < 30:
+    def _get_series(self, symbol: str) -> np.ndarray | None:
+        buf = self._buffers.get(symbol)
+        if buf is None or len(buf) < self.min_samples:
             return None
-        return float(np.corrcoef(b1, b2)[0, 1])
+        return np.asarray(buf, dtype=float)
+
+    def _rolling_corr(self, a: np.ndarray, b: np.ndarray, win: int = 60) -> float | None:
+        n = min(len(a), len(b))
+        if n < win:
+            return None
+        a_win = a[-win:]
+        b_win = b[-win:]
+        c = np.corrcoef(a_win, b_win)[0, 1]
+        return float(c)
 
     # --------------------------------------------------
     # Public API
     # --------------------------------------------------
-    def detect_divergence(self, main_symbol: str, pairs: list[str],
-                          threshold: float = -0.3) -> Dict[str, float]:
-        """Detecta rupturas de correlación.
-
-        Args:
-            main_symbol: símbolo que se está evaluando.
-            pairs: lista de símbolos correlacionados a chequear.
-            threshold: valor máximo permitido antes de marcar ruptura.
-        Returns:
-            Dict con pares que rompen correlación y su nuevo coef.
+    def detect_divergence(
+        self,
+        main_symbol: str,
+        peers: List[str],
+        corr_break_threshold: float = -0.25,
+        window_corr: int = 60,
+    ) -> Dict[str, float]:
         """
+        Devuelve pares con ruptura de correlación (corr < threshold).
+        """
+        base = self._get_series(main_symbol)
         signals: Dict[str, float] = {}
-        for peer in pairs:
-            corr = self._compute_corr(main_symbol, peer)
-            if corr is not None and corr < threshold:
-                signals[peer] = corr
+        if base is None:
+            return signals
+
+        for p in peers:
+            s = self._get_series(p)
+            if s is None:
+                continue
+            c = self._rolling_corr(base, s, win=window_corr)
+            if c is not None and c < corr_break_threshold:
+                signals[p] = c
         return signals
+
+    def divergence_score(
+        self,
+        main_symbol: str,
+        peers: List[str],
+        window_corr: int = 60,
+    ) -> float:
+        """
+        Combina correlaciones con pares en un score [0,1],
+        donde 0 = sin divergencia, 1 = divergencia fuerte generalizada.
+        """
+        base = self._get_series(main_symbol)
+        if base is None:
+            return 0.0
+
+        vals = []
+        for p in peers:
+            s = self._get_series(p)
+            if s is None:
+                continue
+            c = self._rolling_corr(base, s, win=window_corr)
+            if c is not None:
+                # mapear corr [-1,1] a "divergencia" [0,1]
+                # 1 - c → 0 si c=1 (muy correl.), 2 si c=-1; lo normalizamos a [0,1]
+                div = (1 - c) / 2.0
+                vals.append(div)
+
+        if not vals:
+            return 0.0
+        # promedio suavizado
+        return float(np.clip(np.mean(vals), 0.0, 1.0))
