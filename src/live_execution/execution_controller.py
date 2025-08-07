@@ -150,41 +150,6 @@ def donchian_channels(df: pd.DataFrame, period: int = 20) -> Tuple[pd.Series, pd
     lower = df['low'].rolling(window=period, min_periods=period).min()
     return upper, lower
 
-def _ensure_timestamp_col(self, df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Garantiza que exista columna 'timestamp' en UTC.
-    Acepta 'time' o índice DatetimeIndex.
-    """
-    _df = df.copy()
-    if "timestamp" in _df.columns:
-        _df["timestamp"] = pd.to_datetime(_df["timestamp"], utc=True, errors="coerce")
-    elif "time" in _df.columns:
-        _df["timestamp"] = pd.to_datetime(_df["time"], utc=True, errors="coerce")
-    elif isinstance(_df.index, pd.DatetimeIndex):
-        _df["timestamp"] = _df.index.tz_convert("UTC") if _df.index.tz is not None else _df.index.tz_localize("UTC")
-    else:
-        # último recurso: NaT -> luego extraemos now(UTC)
-        _df["timestamp"] = pd.NaT
-    _df = _df.dropna(subset=["timestamp"])
-    return _df
-
-def _extract_df_last_ts(self, df: pd.DataFrame) -> datetime:
-    """
-    Devuelve el timestamp de la última vela como datetime aware UTC.
-    Si no existe, usa now(UTC).
-    """
-    try:
-        if "timestamp" in df.columns and len(df) > 0:
-            ts = df["timestamp"].iloc[-1]
-            ts = pd.to_datetime(ts, utc=True, errors="coerce")
-            if pd.isna(ts):
-                raise ValueError("NaT")
-            return ts.to_pydatetime()
-    except Exception:
-        pass
-    return datetime.now(timezone.utc)
-
-
 
 # -----------------------------------------------------------------------------
 # Wilson LB (90%)
@@ -420,7 +385,52 @@ class OptimizedExecutionController:
         logger.info(f"ℹ️ [{sym}] ChromaDB: Sin resultados para la consulta. (colección='{self.chroma_collection_name}')")
         return None
 
+    # -------------------------------------------------------------------------
+    # Helpers de timestamp (AHORA CORRECTAMENTE DENTRO DE LA CLASE)
+    # -------------------------------------------------------------------------
+    def _ensure_timestamp_col(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Garantiza que exista columna 'timestamp' (UTC) y que el DF quede ordenado.
+        Acepta 'timestamp', 'time' o índice DatetimeIndex. Devuelve el tail(LOOKBACK_BARS).
+        """
+        _df = df.copy()
 
+        if "timestamp" in _df.columns:
+            _df["timestamp"] = pd.to_datetime(_df["timestamp"], utc=True, errors="coerce")
+        elif "time" in _df.columns:
+            _df["timestamp"] = pd.to_datetime(_df["time"], utc=True, errors="coerce")
+        elif isinstance(_df.index, pd.DatetimeIndex):
+            idx = _df.index
+            _df["timestamp"] = (idx.tz_convert("UTC") if idx.tz is not None else idx.tz_localize("UTC"))
+        else:
+            # último recurso: intenta columnas comunes
+            for cand in ("date", "datetime"):
+                if cand in _df.columns:
+                    _df["timestamp"] = pd.to_datetime(_df[cand], utc=True, errors="coerce")
+                    break
+            if "timestamp" not in _df.columns:
+                _df["timestamp"] = pd.NaT
+
+        _df = _df.dropna(subset=["timestamp"])
+        if _df.empty:
+            return _df
+
+        _df = _df.sort_values("timestamp").reset_index(drop=True)
+        return _df.tail(self.LOOKBACK_BARS)
+
+    def _extract_df_last_ts(self, df: pd.DataFrame) -> datetime:
+        """
+        Devuelve el timestamp de la última vela como datetime aware UTC.
+        Si falla, usa now(UTC).
+        """
+        try:
+            if "timestamp" in df.columns and len(df) > 0:
+                ts = pd.to_datetime(df["timestamp"].iloc[-1], utc=True, errors="coerce")
+                if not pd.isna(ts):
+                    return ts.to_pydatetime()
+        except Exception:
+            pass
+        return datetime.now(timezone.utc)
 
     # -------------------------------------------------------------------------
     # Posiciones abiertas
@@ -992,7 +1002,17 @@ class OptimizedExecutionController:
 
         self.last_signal_attempt = {"signal_data": base.copy(), "timestamp": datetime.now(timezone.utc)}
 
-        # 3) Features → scaler/model (… SIN CAMBIOS …)
+        # 3) Features → scaler/model
+        scaled_df = self._prepare_live_feature_row(df)
+        if scaled_df is not None and self.scaler is not None:
+            try:
+                scaled_df = pd.DataFrame(
+                    self.scaler.transform(scaled_df),
+                    columns=scaled_df.columns
+                )
+            except Exception as e:
+                logger.warning(f"⚠️ Error escalando features: {e}")
+                scaled_df = None
 
         # 4) CHROMA + Wilson LB90
         historical_prob = 0.5
@@ -1096,7 +1116,6 @@ class OptimizedExecutionController:
             except Exception as e:
                 logger.warning(f"⚠️ Error validando con ChromaDB: {e}")
 
-
         # 5) Modelo ML
         ml_confidence = 0.5
         if self.model is not None and scaled_df is not None:
@@ -1166,7 +1185,6 @@ class OptimizedExecutionController:
             "n_eff": int(chroma_samples_found),
             "timestamp": ts_last.isoformat(),
         }
-
 
     # -------------------------------------------------------------------------
     # Ejecución
