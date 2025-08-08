@@ -432,7 +432,8 @@ class OrchestratedMT5Bot:
 
 
     def _print_startup_summary(self):
-    
+        import os, json
+
         def _load_risk_cfg_for_banner():
             paths = ["configs/risk_config.json", "risk_config.json"]
             for p in paths:
@@ -446,6 +447,17 @@ class OrchestratedMT5Bot:
             # fallback si no hay config
             return {"mode": "fixed", "fixed_lots": 0.10, "symbol_overrides": {}}
 
+        def _unique_symbols_from_controllers():
+            seen = set()
+            ordered = []
+            for c in getattr(self, "controllers", []):
+                s = getattr(c, "symbol", None)
+                if s and s not in seen:
+                    seen.add(s)
+                    ordered.append(s)
+            # si no hay controllers aún, usa majors por defecto
+            return ordered or ["EURUSD", "GBPUSD", "AUDUSD", "USDJPY"]
+
         def _resolve_display_lots(symbols, risk_cfg):
             mode = str(risk_cfg.get("mode", "fixed")).lower()
             sym_over = risk_cfg.get("symbol_overrides", {}) or {}
@@ -453,10 +465,7 @@ class OrchestratedMT5Bot:
 
             if mode == "fixed":
                 if sym_over:
-                    parts = []
-                    for s in symbols:
-                        v = sym_over.get(s, fixed)
-                        parts.append(f"{s}:{float(v):.2f}")
+                    parts = [f"{s}:{float(sym_over.get(s, fixed)):.2f}" for s in symbols]
                     return f"{', '.join(parts)}", "fixed"
                 else:
                     return f"{float(fixed):.2f}", "fixed"
@@ -466,8 +475,8 @@ class OrchestratedMT5Bot:
 
         try:
             risk_cfg = _load_risk_cfg_for_banner()
-            active_symbols = [c.symbol for c in getattr(self, "controllers", [])] or ["EURUSD","GBPUSD","AUDUSD","USDJPY"]
-            lots_txt, sizing_mode = _resolve_display_lots(active_symbols, risk_cfg)
+            unique_symbols = _unique_symbols_from_controllers()
+            lots_txt, sizing_mode = _resolve_display_lots(unique_symbols, risk_cfg)
 
             print("\n" + "="*80)
             print("🚀 BOT MT5 ORQUESTADO - RESUMEN DE CONFIGURACIÓN")
