@@ -5,10 +5,10 @@
     "partial_close": 0.82,
     "close": 0.90,
 
-    "tcd_tighten": 0.55,
+    "tcd_tighten": 0.52,
     "tcd_close": 0.70,
 
-    "opp_partial_ml": 0.55,
+    "opp_partial_ml": 0.52,
     "opp_partial_lb90": 0.50,
     "opp_close_ml": 0.58,
     "opp_close_lb90": 0.53,

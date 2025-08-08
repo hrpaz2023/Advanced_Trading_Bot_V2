@@ -391,15 +391,18 @@ class OrchestratedMT5Bot:
         self.stop_event = threading.Event()
 
         # ✅ FIX 1: Inicializar stats TEMPRANO
+        # Contadores de señales del loop (para banners/logs)
         self.stats = {
             "signals_generated": 0,
             "signals_approved": 0,
-            "signals_rejected": 0,
-            "signals_blocked_by_position": 0,
             "signals_executed": 0,
-            "news_blocks": 0,
-            "execution_errors": 0,
+            "signals_rejected": 0,
+            "positions_blocked": 0,              # si lo usás en algún lado
+            "signals_blocked_by_position": 0,    # <-- faltaba
+            "signals_blocked_by_news": 0,        # opcional
+            "signals_blocked_by_risk": 0         # opcional
         }
+
 
         # ✅ FIX 2: Inicializar trend_change_detector
 # ---------- PMI & TCD: instancia, buffers y contadores ----------
@@ -442,6 +445,8 @@ class OrchestratedMT5Bot:
             "signals_approved": 0,
             "signals_executed": 0,
             "positions_blocked": 0,
+            "signals_rejected": 0,               # <-- faltaba
+            "signals_rejected_by_controller": 0  # útil si diferenciás rechazos del controller
         }
 
         # Si querés sincronizar lb90_min con los controllers, hacelo donde instancias controllers,
@@ -515,6 +520,13 @@ class OrchestratedMT5Bot:
             except Exception:
                 print(f"PMI config inválido ({path}): {e}. Uso defaults.")
             return defaults
+
+    def _inc_stat(self, key: str, n: int = 1) -> None:
+        try:
+            self.stats[key] = int(self.stats.get(key, 0)) + int(n)
+        except Exception:
+            self.stats[key] = self.stats.get(key, 0)
+
 
 
     def _print_startup_summary(self):
@@ -1482,7 +1494,7 @@ class OrchestratedMT5Bot:
                                 self.stats["signals_generated"] += 1
 
                                 if status == "rejected" and rejection_reason:
-                                    self.stats["signals_rejected"] += 1
+                                    self._inc_stat("signals_rejected")
                                     output = format_signal_output(
                                         c.symbol, c.strategy_name, signal_data,
                                         verdict={"approved": False, "reason": rejection_reason}
@@ -1542,6 +1554,8 @@ class OrchestratedMT5Bot:
                                 # Verificación final anti-doble posición
                                 if not self._verify_no_existing_position(c.symbol):
                                     self.logger.error(f"🔒 [{c.symbol}] EJECUCIÓN CANCELADA: Posición detectada en verificación final")
+                                    self._inc_stat("signals_blocked_by_position")
+                                    f"| Pos❌: {self.stats.get('signals_blocked_by_position', 0)} "
                                     self.stats["signals_blocked_by_position"] += 1
                                     log_data.update({
                                         "status": "position_blocked",
