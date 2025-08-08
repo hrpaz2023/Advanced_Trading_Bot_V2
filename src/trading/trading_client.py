@@ -263,36 +263,46 @@ class TradingClient:
     
     def market_order(self, symbol: str, side: str, lots: float, price: Optional[float] = None, metadata: Optional[Dict] = None) -> Dict[str, Any]:
         """
-        🎯 MÉTODO PRINCIPAL: Ejecutar orden de mercado
-        Este es el método que ExecutionController intentará llamar primero
+        Ejecuta orden de mercado respetando el lote solicitado.
+        Redondea/clamp al step/min/max de MT5 para evitar 'Invalid volume'.
         """
         if not self.connected:
             return {"error": "MT5 no conectado"}
-        
+
         try:
+            import MetaTrader5 as mt5
+
+            # Normalización de volumen a parámetros del símbolo
+            info = mt5.symbol_info(symbol)
+            if info is None:
+                step = 0.01; vmin = 0.01; vmax = 100.0
+            else:
+                step = (getattr(info, "volume_step", 0.01) or 0.01)
+                vmin = (getattr(info, "volume_min", 0.01) or 0.01)
+                vmax = (getattr(info, "volume_max", 100.0) or 100.0)
+            lots_req = float(lots)
+            lots_final = max(vmin, min(round(lots_req / step) * step, vmax))
+
             print(f"🎯 Ejecutando orden de mercado:")
             print(f"   Símbolo: {symbol}")
             print(f"   Lado: {side}")
-            print(f"   Lotes: {lots}")
+            print(f"   Lotes solicitados: {lots_req}")
+            print(f"   Lotes normalizados: {lots_final}")
             print(f"   Magic: {self.magic_number}")
-            
+
             # Validar símbolo
             if not self._validate_symbol(symbol):
                 return {"error": f"Símbolo {symbol} no válido para trading"}
-            
-            # Obtener precio actual
-            current_price = self._get_current_price(symbol, side)
-            if current_price is None:
+
+            # Precio
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is None:
                 return {"error": f"No se pudo obtener precio para {symbol}"}
-            
-            # Usar precio actual si no se especifica
-            if price is None:
-                price = current_price
-                
-            # Determinar tipo de orden
+            px = price if price is not None else (tick.ask if side.upper() == "BUY" else tick.bid)
+
             order_type = mt5.ORDER_TYPE_BUY if side.upper() == "BUY" else mt5.ORDER_TYPE_SELL
-            
-            # Preparar comentario
+
+            # Comentario
             comment = f"Bot_{self.magic_number}"
             if metadata:
                 strategy = metadata.get("strategy", "")
@@ -300,114 +310,50 @@ class TradingClient:
                 if strategy:
                     comment += f"_{strategy}"
                 if timestamp:
-                    comment += f"_{timestamp[:10]}"  # Solo fecha
-            
-            # Construir request
+                    comment += f"_{timestamp[:10]}"
+            comment = comment[:31]
+
             request = {
                 "action": mt5.TRADE_ACTION_DEAL,
                 "symbol": symbol,
-                "volume": float(lots),
+                "volume": lots_final,
                 "type": order_type,
-                "price": float(price),
-                "deviation": 20,  # Desviación en puntos
+                "price": float(px),
+                "deviation": 20,
                 "magic": int(self.magic_number),
-                "comment": comment[:31],  # MT5 limita a 31 caracteres
+                "comment": comment,
                 "type_time": mt5.ORDER_TIME_GTC,
                 "type_filling": mt5.ORDER_FILLING_IOC,
             }
-            
-            print(f"📤 Enviando orden:")
-            print(f"   Request: {request}")
-            
-            # Enviar orden
+
+            print(f"📤 Enviando orden:\n   Request: {request}")
             result = mt5.order_send(request)
-            
             if result is None:
                 return {"error": "order_send devolvió None"}
-            
-            print(f"📥 Resultado MT5:")
-            print(f"   Retcode: {result.retcode}")
-            print(f"   Comment: {result.comment if hasattr(result, 'comment') else 'N/A'}")
-            
-            # Verificar resultado
+
+            print(f"📥 Resultado MT5:\n   Retcode: {result.retcode}\n   Comment: {getattr(result, 'comment', 'N/A')}")
+
             if result.retcode != mt5.TRADE_RETCODE_DONE:
                 error_msg = f"MT5 Error {result.retcode}"
                 if hasattr(result, 'comment'):
                     error_msg += f": {result.comment}"
-                
-                # Mapear códigos de error comunes
-                error_codes = {
-                    10004: "Requote - precio cambió",
-                    10006: "Request rejected - solicitud rechazada",
-                    10007: "Request canceled - solicitud cancelada", 
-                    10008: "Order placed - orden colocada (pendiente)",
-                    10009: "Request completed - completado",
-                    10010: "Request partial - parcialmente completado",
-                    10011: "Request processing error - error de procesamiento",
-                    10012: "Request canceled by timeout - cancelado por timeout",
-                    10013: "Invalid request - request inválido",
-                    10014: "Invalid volume - volumen inválido",
-                    10015: "Invalid price - precio inválido",
-                    10016: "Invalid stops - stops inválidos",
-                    10017: "Trade disabled - trading deshabilitado",
-                    10018: "Market closed - mercado cerrado",
-                    10019: "Not enough money - fondos insuficientes",
-                    10020: "Price changed - precio cambió",
-                    10021: "Off quotes - sin cotizaciones",
-                    10022: "Invalid expiration - expiración inválida",
-                    10023: "Order state changed - estado de orden cambió",
-                    10024: "Too frequent requests - requests muy frecuentes",
-                    10025: "No changes - sin cambios",
-                    10026: "Auto trading disabled - auto trading deshabilitado",
-                    10027: "Auto trading disabled by server - auto trading deshabilitado por servidor",
-                    10028: "Auto trading disabled by client - auto trading deshabilitado por cliente",
-                    10029: "Request locked - request bloqueado",
-                    10030: "Order or position frozen - orden/posición congelada",
-                    10031: "Invalid symbol type - tipo de símbolo inválido",
-                }
-                
-                detailed_error = error_codes.get(result.retcode, "Error desconocido")
-                print(f"❌ {error_msg} - {detailed_error}")
-                
-                return {"error": f"{error_msg} - {detailed_error}"}
-            
-            # Éxito
+                return {"error": error_msg, "request": request}
+
             ticket = result.order if hasattr(result, 'order') else result.deal
-            executed_price = result.price if hasattr(result, 'price') else price
-            executed_volume = result.volume if hasattr(result, 'volume') else lots
-            
-            success_result = {
-                "ticket": ticket,
-                "price": executed_price,
-                "volume": executed_volume,
-                "retcode": result.retcode
-            }
-            
+            executed_price = result.price if hasattr(result, 'price') else px
+            executed_volume = result.volume if hasattr(result, 'volume') else lots_final
+
             print(f"✅ Orden ejecutada exitosamente:")
             print(f"   Ticket: {ticket}")
             print(f"   Precio: {executed_price}")
             print(f"   Volumen: {executed_volume}")
-            
-            return success_result
-            
+
+            return {"ticket": ticket, "price": executed_price, "volume": executed_volume, "retcode": result.retcode}
+
         except Exception as e:
-            error_msg = f"Error inesperado en market_order: {str(e)}"
-            print(f"❌ {error_msg}")
             import traceback
             traceback.print_exc()
-            return {"error": error_msg}
-    
-    def send_order(self, symbol: str, side: str, lots: float, price: Optional[float] = None, metadata: Optional[Dict] = None) -> Dict[str, Any]:
-        """Alias para market_order - ExecutionController también busca este método"""
-        return self.market_order(symbol, side, lots, price, metadata)
-    
-    def place_market_order(self, symbol: str, side: str, lots: float) -> Dict[str, Any]:
-        """Versión simplificada sin metadata - ExecutionController también busca este método"""
-        return self.market_order(symbol, side, lots)
-    
-    def order_send(self, symbol: str, side: str, lots: float, price: float) -> Dict[str, Any]:
-        """Versión con precio fijo - ExecutionController también busca este método"""
-        return self.market_order(symbol, side, lots, price)
+            return {"error": f"Error inesperado en market_order: {e}"}
 
     # =========================================================================
     # MÉTODOS AUXILIARES Y LEGACY

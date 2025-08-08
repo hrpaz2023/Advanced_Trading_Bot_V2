@@ -38,47 +38,88 @@ class RiskManager:
     
     def calculate_position_size(self, account_equity, stop_loss_pips, symbol="EURUSD", risk_pct=None):
         """
-        Calcula tamaño de posición basado en riesgo
-        
-        Args:
-            account_equity: Balance de la cuenta
-            stop_loss_pips: Distancia del stop loss en pips
-            symbol: Símbolo del instrumento (para valor de pip)
-            risk_pct: Porcentaje de riesgo (opcional)
-        
-        Returns:
-            float: Tamaño de posición en lotes
+        Calcula tamaño de posición en lotes.
+        Reglas:
+        - Si hay override fijo en configs/risk_config.json -> usarlo (también por símbolo).
+        - Si no hay override, usar cálculo por % de riesgo (comportamiento actual).
+        Siempre normaliza al step/min/max de MT5 si disponible.
         """
+        import json, os
         try:
-            # Validar inputs
+            # --- helpers locales ---
+            def _load_fixed_override(sym: str):
+                """Lee configs/risk_config.json (opcional) y devuelve lots fijos si corresponden."""
+                paths = ["configs/risk_config.json", "risk_config.json"]
+                for p in paths:
+                    if os.path.exists(p):
+                        try:
+                            with open(p, "r", encoding="utf-8") as f:
+                                cfg = json.load(f)
+                            ps = cfg.get("position_sizing", cfg)
+                            mode = str(ps.get("mode", "")).lower()
+                            # override por símbolo
+                            sym_over = ps.get("symbol_overrides", {}) or {}
+                            if sym in sym_over:
+                                return float(sym_over[sym])
+                            # modo fijo global
+                            if mode == "fixed":
+                                fl = ps.get("fixed_lots", ps.get("base_lot"))
+                                if fl is not None:
+                                    return float(fl)
+                        except Exception:
+                            pass
+                return None
+
+            def _mt5_round_volume(sym: str, lots: float) -> float:
+                """Redondeo/clamp a parámetros del símbolo en MT5. Fallback step=0.01, [0.01, 100]."""
+                try:
+                    import MetaTrader5 as mt5
+                    info = mt5.symbol_info(sym)
+                    if info is None:
+                        step = 0.01; vmin = 0.01; vmax = 100.0
+                    else:
+                        step = (getattr(info, "volume_step", 0.01) or 0.01)
+                        vmin = (getattr(info, "volume_min", 0.01) or 0.01)
+                        vmax = (getattr(info, "volume_max", 100.0) or 100.0)
+                    rounded = round(float(lots) / step) * step
+                    return max(vmin, min(rounded, vmax))
+                except Exception:
+                    return max(0.01, min(round(float(lots), 2), 100.0))
+            # --- fin helpers ---
+
+            # 0) Override fijo desde config (prioridad absoluta)
+            fixed = _load_fixed_override(symbol)
+            if fixed is not None:
+                return _mt5_round_volume(symbol, float(fixed))
+
+            # 1) VALIDACIONES BÁSICAS (mismo comportamiento que tenías)
             if account_equity <= 0:
                 print(f"⚠️ Account equity inválido: {account_equity}")
                 return 0.01
-            
             if stop_loss_pips <= 0:
                 print(f"⚠️ Stop loss pips inválido: {stop_loss_pips}, usando 20 por defecto")
-                stop_loss_pips = 20  # Default fallback más razonable
-            
-            # Calcular riesgo
-            risk_percentage = risk_pct or self.risk_per_trade
-            risk_amount = account_equity * (risk_percentage / 100)
-            
-            # Obtener valor de pip específico del símbolo
+                stop_loss_pips = 20
+
+            # 2) CÁLCULO POR % RIESGO (como antes)
+            risk_percentage = (risk_pct or self.risk_per_trade)
+            risk_amount = account_equity * (risk_percentage / 100.0)
+
             pip_value = self.get_pip_value(symbol)
-            
-            # Calcular position size
             position_size = risk_amount / (stop_loss_pips * pip_value)
-            
-            # ✅ NORMALIZAR SEGÚN ESTÁNDARES DEL MERCADO
-            # Mínimo: 0.01 lotes, Máximo: 10 lotes, Step: 0.01
+
+            # 3) NORMALIZACIÓN: primero bounding genérico y luego step de MT5
             normalized_size = round(position_size, 2)
-            final_size = max(0.01, min(10.0, normalized_size))
-            
+            bounded = max(0.01, min(10.0, normalized_size))
+
+            # 4) Aplicar step/min/max reales del símbolo en MT5
+            final_size = _mt5_round_volume(symbol, bounded)
             return final_size
-            
+
         except Exception as e:
             print(f"❌ Error calculando position size: {e}")
             return 0.01
+
+
     
     def get_trade_params(self, entry_price, atr, side, symbol="EURUSD"):
         """

@@ -432,26 +432,66 @@ class OrchestratedMT5Bot:
 
 
     def _print_startup_summary(self):
-        print("\n" + "="*80)
-        print("🚀 BOT MT5 ORQUESTADO - RESUMEN DE CONFIGURACIÓN")
-        print("="*80)
-        print(f"📊 Timeframe: {self.timeframe}")
-        print(f"💰 Lotes base: {self.base_lots}")
-        print(f"⏱️  Ciclo: {self.cycle_seconds}s")
-        print(f"🎯 Controllers activos: {len(self.controllers)}")
-        if self.controllers:
-            print("\n📈 INSTRUMENTOS Y ESTRATEGIAS:")
-            for i, c in enumerate(self.controllers, 1):
-                print(f"   {i}. {c.symbol} → {c.strategy_name}")
-        print(f"\n🔌 Conexiones:")
-        print(f"   • MT5: {'✅ Conectado' if self.mt5_connected else '❌ Desconectado'}")
-        print(f"   • TradingClient: {'✅ Activo' if self.client else '❌ No disponible'}")
-        print(f"   • Notifier: {'✅ Activo' if self.notifier else '❌ No disponible'}")
-        print(f"   • NewsFilter: {'✅ Activo' if self.news_filter else '❌ No disponible'}")
-        print(f"\n🔒 CONTROL DE POSICIONES: ACTIVADO")
-        print("   • Prevención de múltiples posiciones por símbolo")
-        print("   • Verificación en tiempo real con MT5")
-        print("="*80 + "\n")
+    
+        def _load_risk_cfg_for_banner():
+            paths = ["configs/risk_config.json", "risk_config.json"]
+            for p in paths:
+                if os.path.exists(p):
+                    try:
+                        with open(p, "r", encoding="utf-8") as f:
+                            raw = json.load(f)
+                        return raw.get("position_sizing", raw)
+                    except Exception:
+                        pass
+            # fallback si no hay config
+            return {"mode": "fixed", "fixed_lots": 0.10, "symbol_overrides": {}}
+
+        def _resolve_display_lots(symbols, risk_cfg):
+            mode = str(risk_cfg.get("mode", "fixed")).lower()
+            sym_over = risk_cfg.get("symbol_overrides", {}) or {}
+            fixed = risk_cfg.get("fixed_lots", risk_cfg.get("base_lot", 0.10))
+
+            if mode == "fixed":
+                if sym_over:
+                    parts = []
+                    for s in symbols:
+                        v = sym_over.get(s, fixed)
+                        parts.append(f"{s}:{float(v):.2f}")
+                    return f"{', '.join(parts)}", "fixed"
+                else:
+                    return f"{float(fixed):.2f}", "fixed"
+
+            pct = float(risk_cfg.get("risk_per_trade", 1.0))
+            return f"{pct:.2f}% (percent_risk)", "percent_risk"
+
+        try:
+            risk_cfg = _load_risk_cfg_for_banner()
+            active_symbols = [c.symbol for c in getattr(self, "controllers", [])] or ["EURUSD","GBPUSD","AUDUSD","USDJPY"]
+            lots_txt, sizing_mode = _resolve_display_lots(active_symbols, risk_cfg)
+
+            print("\n" + "="*80)
+            print("🚀 BOT MT5 ORQUESTADO - RESUMEN DE CONFIGURACIÓN")
+            print("="*80)
+            print(f"📊 Timeframe: {self.timeframe}")
+            print(f"💰 Lotes ({sizing_mode}): {lots_txt}")
+            print(f"⏱️  Ciclo: {self.cycle_seconds}s")
+            print(f"🎯 Controllers activos: {len(self.controllers)}")
+            if self.controllers:
+                print("\n📈 INSTRUMENTOS Y ESTRATEGIAS:")
+                for i, c in enumerate(self.controllers, 1):
+                    print(f"   {i}. {c.symbol} → {c.strategy_name}")
+            print(f"\n🔌 Conexiones:")
+            print(f"   • MT5: {'✅ Conectado' if self.mt5_connected else '❌ Desconectado'}")
+            print(f"   • TradingClient: {'✅ Activo' if self.client else '❌ No disponible'}")
+            print(f"   • Notifier: {'✅ Activo' if self.notifier else '❌ No disponible'}")
+            print(f"   • NewsFilter: {'✅ Activo' if self.news_filter else '❌ No disponible'}")
+            print(f"\n🔒 CONTROL DE POSICIONES: ACTIVADO")
+            print("   • Prevención de múltiples posiciones por símbolo")
+            print("   • Verificación en tiempo real con MT5")
+            print("="*80 + "\n")
+        except Exception as e:
+            print(f"⚠️ No se pudo imprimir el resumen de configuración: {e}")
+
 
     # --------- setup ---------
     def _load_json(self, path, name):
