@@ -390,63 +390,29 @@ class OrchestratedMT5Bot:
         self.cycle_seconds = cycle_seconds
         self.stop_event = threading.Event()
 
-        # ✅ FIX 1: Inicializar stats TEMPRANO
-        self.stats = {
-            "signals_generated": 0,
-            "signals_approved": 0,
-            "signals_rejected": 0,
-            "signals_blocked_by_position": 0,
-            "signals_executed": 0,
-            "news_blocks": 0,
-            "execution_errors": 0,
-        }
-
-        # ✅ FIX 2: Inicializar trend_change_detector
-# ---------- PMI & TCD: instancia, buffers y contadores ----------
-        # Trend-Change Detector (para prob. de giro por símbolo)
+        # ---------- PMI: instancia y buffers -----------------
         try:
-            self.trend_change_detector = TrendChangeDetector() if TrendChangeDetector else None
+            # si querés observer, cambia a mode="observer"
+            self.pmi = SmartPositionManager(mode="active")
         except Exception:
-            self.trend_change_detector = None
-
-        # Cargar config PMI desde JSON
-        pmi_cfg = self._load_pmi_config()  # {"mode": "...", "thresholds": {...}, "lb90_min": ...}
-
-        # PMI (Position Management Intelligence)
-        try:
-            self.pmi = SmartPositionManager(
-                mode=pmi_cfg.get("mode", "active"),
-                close_thresholds=pmi_cfg.get("thresholds", None),
-            )
-        except Exception:
-            # fallback por si cambió la firma
+            # fallback por si hubo cambios de firma
             self.pmi = SmartPositionManager()
 
-        # Flag: ¿aplicamos acciones del PMI?
+        # Señal de si está activo (útil para decidir si aplicar acciones)
         self.pmi_active = (getattr(self.pmi, "mode", "observer") == "active")
 
-        # Contexto de la última señal por símbolo (para “señal opuesta” y TCD)
+        # Buffer de contexto de señales por símbolo (para “señal opuesta” y TCD)
         self._last_signal_ctx = {}  # {"EURUSD": {"signal_side":"BUY","ml_confidence":0.66,"historical_prob_lb90":0.58,"tcd_prob":0.61}, ...}
 
-        # Telemetría PMI
+        # Contadores de decisiones (telemetría)
         self.pmi_stats = {
             "evaluations": 0,
             "close_signals": 0,
             "partial_close": 0,
             "tighten_sl": 0,
         }
+        # -----------------------------------------------------
 
-        # Contadores de señales del loop (para banners/logs)
-        self.stats = {
-            "signals_generated": 0,
-            "signals_approved": 0,
-            "signals_executed": 0,
-            "positions_blocked": 0,
-        }
-
-        # Si querés sincronizar lb90_min con los controllers, hacelo donde instancias controllers,
-        # leyendo pmi_cfg["lb90_min"] y pasándolo a cada controlador como parámetro.
-        # ---------------------------------------------------------------
 
         # Carga de configs y setup de subsistemas (ajusta según tus helpers)
         self.global_cfg = self._load_json(config_path, "global_config")
@@ -466,55 +432,6 @@ class OrchestratedMT5Bot:
 
         self.logger.info("✅ Bot MT5 orquestado inicializado con control de posiciones.")
         self._print_startup_summary()
-
-    def _load_pmi_config(self, path: str = "configs/pmi_config.json") -> dict:
-        """
-        Lee configs/pmi_config.json si existe. Devuelve dict con defaults seguros si falta o está mal.
-        Estructura esperada:
-        {
-        "mode": "active" | "observer",
-        "thresholds": { ... },
-        "lb90_min": 0.25
-        }
-        """
-        defaults = {
-            "mode": "active",
-            "thresholds": {
-                "tighten_sl": 0.70,
-                "partial_close": 0.82,
-                "close": 0.90,
-                "tcd_tighten": 0.55,
-                "tcd_close": 0.70,
-                "opp_partial_ml": 0.55,
-                "opp_partial_lb90": 0.50,
-                "opp_close_ml": 0.58,
-                "opp_close_lb90": 0.53,
-                "partial_fraction": 0.50
-            },
-            "lb90_min": 0.25
-        }
-        try:
-            p = Path(path)
-            if not p.exists():
-                self.logger.warning(f"PMI config no encontrado: {path}. Uso defaults.")
-                return defaults
-            with p.open("r", encoding="utf-8") as f:
-                cfg = json.load(f) or {}
-            # merge superficial (mantiene defaults si faltan llaves)
-            out = dict(defaults)
-            out["mode"] = str(cfg.get("mode", defaults["mode"])).lower()
-            thr = dict(defaults["thresholds"])
-            thr.update(cfg.get("thresholds", {}) or {})
-            out["thresholds"] = thr
-            out["lb90_min"] = float(cfg.get("lb90_min", defaults["lb90_min"]))
-            self.logger.info(f"✅ pmi_config cargado: {path}")
-            return out
-        except Exception as e:
-            try:
-                self.logger.warning(f"PMI config inválido ({path}): {e}. Uso defaults.")
-            except Exception:
-                print(f"PMI config inválido ({path}): {e}. Uso defaults.")
-            return defaults
 
 
     def _print_startup_summary(self):
@@ -591,13 +508,7 @@ class OrchestratedMT5Bot:
         except Exception as e:
             print(f"⚠️ No se pudo imprimir el resumen de configuración: {e}")
 
-        try:
-            thr = getattr(self.pmi, "close_thresholds", {})
-            print(f"\n🧠 PMI: modo={getattr(self.pmi,'mode','unknown')} | LB90_min={pmi_cfg.get('lb90_min',0.25):.2f}")
-            print(f"   • Umbrales: close={thr.get('close'):.2f} partial={thr.get('partial_close'):.2f} tighten={thr.get('tighten_sl'):.2f} | tcd_close={thr.get('tcd_close'):.2f}")
-        except Exception:
-            pass
-    
+
     # --------- setup ---------
     def _load_json(self, path, name):
         try:
@@ -889,7 +800,7 @@ class OrchestratedMT5Bot:
     def _compute_lot_size(self, symbol: str, atr_value: float | None = None) -> float:
         """Devuelve el tamaño final a enviar al bróker."""
         # 1) base_lots desde orchestrator_config o desde el parámetro del bot
-        sizing_cfg = getattr(self, 'orchestrator_config', {}).get("sizing", {})
+        sizing_cfg = self.orchestrator_config.get("sizing", {})
         base_lots_cfg = float(sizing_cfg.get("base_lots", self.base_lots))
         method = (self.risk_cfg.get("position_sizing_method") or "fixed").lower()
 
@@ -905,7 +816,7 @@ class OrchestratedMT5Bot:
         lots = min(lots, max_local)
 
         # 3) recortes por exposición direccional si lo tienes activo
-        exp_cfg = getattr(self, 'orchestrator_config', {}).get("exposure_limits", {})
+        exp_cfg = self.orchestrator_config.get("exposure_limits", {})
         max_dir_net = float(exp_cfg.get("max_direction_net_lots", 999.0))
         # Nota: si ya controlas net exposure fuera, podés omitir este recorte aquí
 
@@ -1151,11 +1062,6 @@ class OrchestratedMT5Bot:
         """
         try:
             ctx = {}
-            
-            # ✅ FIX 3: Verificar que signal_result no sea None
-            if signal_result is None:
-                return
-                
             # lado de la señal
             side = signal_result.get("side") or signal_result.get("action") or signal_result.get("signal_side")
             if side:
@@ -1686,4 +1592,3 @@ if __name__ == "__main__":
         cycle_seconds=30,
     )
     bot.run()
-            
