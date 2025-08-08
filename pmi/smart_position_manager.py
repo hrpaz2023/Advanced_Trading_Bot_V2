@@ -9,9 +9,9 @@ from typing import Any, Dict, List, Optional
 import datetime as dt
 
 try:
-    import pandas as pd  # solo se usa si llega candles_by_symbol
-except Exception:  # pragma: no cover
-    pd = None  # degradación suave
+    import pandas as pd  # solo si llegan velas
+except Exception:
+    pd = None
 
 # ---------------------------------------------------------------------
 # Enums (usamos los tuyos si existen; si no, fallback local)
@@ -19,7 +19,7 @@ except Exception:  # pragma: no cover
 try:
     from .enums import DecisionAction
 except Exception:
-    class DecisionAction:  # fallback mínimo
+    class DecisionAction:
         HOLD = "HOLD"
         TIGHTEN_SL = "TIGHTEN_SL"
         PARTIAL_CLOSE = "PARTIAL_CLOSE"
@@ -27,7 +27,7 @@ except Exception:
 
 
 # ---------------------------------------------------------------------
-# Dataclass de salida (si ya tenés algo similar, este es compatible)
+# Estructura de salida
 # ---------------------------------------------------------------------
 @dataclass
 class PMIDecision:
@@ -45,11 +45,12 @@ class PMIDecision:
 # ---------------------------------------------------------------------
 class SmartPositionManager:
     """
-    PMI: decide TIGHTEN/PARTIAL/CLOSE según:
+    PMI: decide TIGHTEN/PARTIAL/CLOSE combinando:
     - Escalera basada en R (PnL/ATR aprox)
     - Score de debilidad (TCD, slope EMA20, contracción ATR, RSI, proximidad S/R)
     - Umbrales externos en configs/pmi_config.json
     - S/R diarios desde configs/daily_sentiment_YYYYMMDD.json (opcional)
+    - OBJETIVOS EN USD POR TRADE (usd_partial, usd_close)
     """
 
     def __init__(
@@ -63,13 +64,16 @@ class SmartPositionManager:
         self.mode = (mode or "observer").lower()
         self.logger = logger
 
-        # 1) Cargar thresholds desde pmi_config.json (si no vinieron por parámetro)
+        # 1) thresholds base
         cfg = self._load_pmi_config(pmi_config_path)
         if close_thresholds is None:
             close_thresholds = cfg.get("thresholds", {}) or {}
         self.close_thresholds = self._merge_thresholds(close_thresholds)
 
-        # 2) Cargar S/R desde daily sentiment (opcional)
+        # 2) objetivos en USD por trade
+        self.usd_targets = self._merge_usd_targets(cfg.get("profit_targets", {}))
+
+        # 3) S/R diarios
         self.sr_levels = self._load_daily_sentiment(daily_sentiment_path)
 
     # ---------------------------------------------------------
@@ -85,19 +89,22 @@ class SmartPositionManager:
     ) -> List[PMIDecision]:
         """
         Devuelve lista de decisiones PMI por posición abierta.
-        - positions: [{"ticket", "symbol", "type" (BUY/SELL), "volume", "price_open", "sl" (opc), "tp" (opc)}]
-        - market_snapshot: {symbol: {"close":..., "atr":..., "atr_rel":...}}
-        - candles_by_symbol: {symbol: df con columnas típicas ["time","open","high","low","close"]}
+        - positions: [{"ticket","symbol","type"(BUY/SELL),"volume","price_open","sl","tp"}]
+        - market_snapshot: {symbol: {"close":..., "atr":..., "atr_rel":..., "contract_size":..., "point":..., "pip":..., "usd_per_pip_per_lot":...}}
+        - candles_by_symbol: {symbol: df con ["time","open","high","low","close"]}
         - signal_context_by_symbol: {symbol: {"signal_side","ml_confidence","historical_prob_lb90","tcd_prob", ...}}
         """
         now = now or dt.datetime.now(dt.timezone.utc)
         out: List[PMIDecision] = []
 
         for pos in positions:
-            symbol = str(pos.get("symbol"))
+            symbol = str(pos.get("symbol", "")).upper()
             ticket = int(pos.get("ticket", 0))
             side = str(pos.get("type", "")).upper()  # BUY/SELL
-            if not symbol or side not in ("BUY", "SELL"):
+            vol = _num(pos.get("volume"))
+            price_open = _num(pos.get("price_open"))
+
+            if not symbol or side not in ("BUY", "SELL") or vol <= 0 or price_open <= 0:
                 continue
 
             snap = market_snapshot.get(symbol, {}) if market_snapshot else {}
@@ -107,9 +114,7 @@ class SmartPositionManager:
             if atr_abs <= 0 and atr_rel > 0 and close > 0:
                 atr_abs = close * atr_rel
 
-            price_open = _num(pos.get("price_open"))
-            if close <= 0 or price_open <= 0 or atr_abs <= 0:
-                # sin datos suficientes -> HOLD
+            if close <= 0 or atr_abs <= 0:
                 out.append(PMIDecision(
                     ticket=ticket, symbol=symbol,
                     action=DecisionAction.HOLD, reason="insufficient_snapshot",
@@ -117,65 +122,71 @@ class SmartPositionManager:
                 ))
                 continue
 
-            # PnL en ATR ("R" aproximado)
+            # ========= PnL aproximado en R (ATR) y en USD =========
             pnl_r = _pnl_r(side, price_open, close, atr_abs)
+            usd_pppl = _num(snap.get("usd_per_pip_per_lot"))  # si el main lo provee, perfecto
+            contract_size = _num(snap.get("contract_size"), 100_000.0)  # default FX lot
+            point = _num(snap.get("point"))  # tamaño de punto (tick)
+            usd_pnl = self._estimate_unrealized_usd(symbol, side, price_open, close, vol, contract_size, point, usd_pppl)
 
-            # Señal reciente / TCD / prob LB90
+            # ========= Contexto de señal reciente / TCD =========
             ctx = (signal_context_by_symbol or {}).get(symbol, {}) if signal_context_by_symbol else {}
             ml = _num(ctx.get("ml_confidence"))
             lb90 = _num(ctx.get("historical_prob_lb90"))
             tcd_prob = _num(ctx.get("tcd_prob"))
             sig_side = (ctx.get("signal_side") or "").upper()
 
-            # S/R diarios si existen
+            # ========= S/R diarios si existen =========
             sr = (self.sr_levels.get(symbol) if self.sr_levels else {}) or {}
             support = _num(sr.get("support"))
             resistance = _num(sr.get("resistance"))
 
-            # Debilidad del movimiento actual
+            # ========= Debilidad del movimiento =========
             deb_score, deb_factors = self._weakness_score(
-                symbol=symbol,
-                side=side,
-                close=close,
-                atr=atr_abs,
-                tcd_prob=tcd_prob,
-                lb90=lb90,
-                ml=ml,
-                sig_side=sig_side,
+                symbol=symbol, side=side, close=close, atr=atr_abs,
+                tcd_prob=tcd_prob, lb90=lb90, ml=ml, sig_side=sig_side,
                 support=support if support > 0 else None,
                 resistance=resistance if resistance > 0 else None,
                 df=(candles_by_symbol or {}).get(symbol) if candles_by_symbol else None,
             )
 
-            # Decisiones por escalera R-based
+            # ========= 1) Regla por objetivos USD (tiene prioridad) =========
+            usd_decision = self._usd_target_decision(usd_pnl)
+
+            # ========= 2) Escalera R-based =========
             ladder_decision = self._ladder_decision(pnl_r)
 
-            # Decisiones por debilidad
+            # ========= 3) Debilidad técnica =========
             weakness_decision = self._weakness_decision(deb_score)
 
-            # Selección de acción final (la “más fuerte”)
-            final_decision, reason, fraction = self._combine_actions(ladder_decision, weakness_decision)
-
-            # Si hay señal opuesta fuerte, puede superar
+            # ========= 4) Señal opuesta fuerte =========
             opp_action, opp_reason = self._opposite_signal_decision(side, sig_side, ml, lb90)
-            if opp_action is not None:
-                final_decision, reason = opp_action, opp_reason
 
-            # En modo observer → no aplica, pero reporta
-            action_to_report = final_decision if self.mode == "active" else DecisionAction.HOLD
+            # Combinar (prioridad: opp > usd > weakness > ladder > hold)
+            final_action, reason, fraction = DecisionAction.HOLD, "hold", 0.0
+            if opp_action is not None:
+                final_action, reason = opp_action, opp_reason
+            elif usd_decision is not None:
+                final_action, reason, fraction = usd_decision.action, usd_decision.reason, usd_decision.fraction or 0.0
+            else:
+                final_action, reason, fraction = self._combine_actions(weakness_decision, ladder_decision)
+
+            # Modo observador -> reporta HOLD
+            reported_action = final_action if self.mode == "active" else DecisionAction.HOLD
 
             out.append(PMIDecision(
                 ticket=ticket,
                 symbol=symbol,
-                action=action_to_report,
+                action=reported_action,
                 reason=reason,
                 close_score=deb_score,
                 fraction=fraction,
                 telemetry={
+                    "usd_pnl": usd_pnl,
+                    "r_pnl": pnl_r,
                     "factors": deb_factors,
                     "ml": ml, "lb90": lb90, "tcd": tcd_prob,
                     "pos_side": side, "sig_side": sig_side,
-                    "r_pnl": pnl_r,
                     "sr_support": support if support > 0 else None,
                     "sr_resistance": resistance if resistance > 0 else None,
                 }
@@ -187,10 +198,7 @@ class SmartPositionManager:
     # Internals
     # ---------------------------------------------------------
     def _load_pmi_config(self, path: str) -> Dict[str, Any]:
-        defaults = {
-            "mode": "active",
-            "thresholds": {}
-        }
+        defaults = {"mode": "active", "thresholds": {}, "profit_targets": {}}
         try:
             p = Path(path)
             if not p.exists():
@@ -204,57 +212,36 @@ class SmartPositionManager:
             return defaults
 
     def _merge_thresholds(self, user_thr: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Merge de thresholds del JSON con defaults internos:
-        """
         d = {
-            # Escalera R-based
-            "ladder": {
-                "be_at": 0.30,
-                "tighten_at": 0.60,
-                "partial1_at": 1.00,
-                "partial2_at": 1.50,
-                "partial_fraction": 0.50
-            },
-            # Debilidad
-            "weak_score": {
-                "tighten": 0.55,
-                "partial": 0.70,
-                "close": 0.85
-            },
-            # TCD puro
-            "tcd": {
-                "tighten": 0.55,
-                "close": 0.70
-            },
-            # Señal opuesta
-            "opp_partial_ml": 0.55,
-            "opp_partial_lb90": 0.50,
-            "opp_close_ml": 0.58,
-            "opp_close_lb90": 0.53
+            "ladder": {"be_at": 0.30, "tighten_at": 0.60, "partial1_at": 1.00, "partial2_at": 1.50, "partial_fraction": 0.50},
+            "weak_score": {"tighten": 0.55, "partial": 0.70, "close": 0.85},
+            "tcd": {"tighten": 0.55, "close": 0.70},
+            "opp_partial_ml": 0.55, "opp_partial_lb90": 0.50,
+            "opp_close_ml": 0.58, "opp_close_lb90": 0.53
         }
         try:
             u = dict(user_thr or {})
-            # sub-bloques
             for k in ("ladder", "weak_score", "tcd"):
                 if k in u and isinstance(u[k], dict):
                     d[k].update(u[k])
-            # llaves planas
             for k in ("opp_partial_ml", "opp_partial_lb90", "opp_close_ml", "opp_close_lb90"):
-                if k in u:
-                    d[k] = float(u[k])
+                if k in u: d[k] = float(u[k])
+        except Exception:
+            pass
+        return d
+
+    def _merge_usd_targets(self, user: Dict[str, Any]) -> Dict[str, Any]:
+        d = {"usd_partial": 300.0, "usd_close": 500.0, "partial_fraction": 0.50}
+        try:
+            if isinstance(user, dict):
+                for k in d.keys():
+                    if k in user:
+                        d[k] = float(user[k])
         except Exception:
             pass
         return d
 
     def _load_daily_sentiment(self, sentiment_path: Optional[str]) -> Dict[str, Dict[str, float]]:
-        """
-        Lee soporte/resistencia desde:
-          - path explícito, o
-          - configs/daily_sentiment_YYYYMMDD.json (UTC hoy)
-        Estructura esperada:
-        { "pairs": { "EURUSD": {"support":1.1445,"resistance":1.167, ...}, ... } }
-        """
         try:
             p = None
             if sentiment_path:
@@ -280,45 +267,21 @@ class SmartPositionManager:
             self._log(f"Daily sentiment inválido: {e}. S/R no disponibles.")
             return {}
 
-    def _weakness_score(
-        self,
-        symbol: str,
-        side: str,
-        close: float,
-        atr: float,
-        tcd_prob: float,
-        lb90: float,
-        ml: float,
-        sig_side: str,
-        support: Optional[float],
-        resistance: Optional[float],
-        df: Optional["pd.DataFrame"],
-    ) -> (float, Dict[str, Any]):
-        """
-        Combina factores de debilidad en [0..1].
-        Pesos:
-          - TCD: 0.40
-          - EMA20 slope <= 0: 0.20
-          - Contracción ATR: 0.15
-          - RSI “salida de momentum”: 0.15
-          - Proximidad a S/R: 0.10
-        """
+    # --------- Cálculos de score / escalera / señal opuesta ----------
+    def _weakness_score(self, symbol, side, close, atr, tcd_prob, lb90, ml, sig_side,
+                        support, resistance, df):
         weights = {"tcd": 0.40, "slope": 0.20, "atr_contract": 0.15, "rsi_exit": 0.15, "sr_near": 0.10}
         f = {"tcd": 0.0, "slope": 0.0, "atr_contract": 0.0, "rsi_exit": 0.0, "sr_near": 0.0}
 
-        # TCD
-        f["tcd"] = float(max(0.0, min(1.0, tcd_prob))) if tcd_prob == tcd_prob else 0.0  # NaN-safe
+        f["tcd"] = float(max(0.0, min(1.0, tcd_prob))) if tcd_prob == tcd_prob else 0.0
 
-        # EMA20 slope / ATR change / RSI a partir de DF si existe
         if pd is not None and isinstance(df, pd.DataFrame) and len(df) >= 25 and "close" in df.columns:
-            # slope: diferencia de medias últimas 20 vs 20-previas
             try:
                 ema = df["close"].ewm(span=20, adjust=False).mean()
-                slope = float(ema.iloc[-1] - ema.iloc[-5])  # simple pendiente
+                slope = float(ema.iloc[-1] - ema.iloc[-5])
                 f["slope"] = 1.0 if (side == "BUY" and slope <= 0) or (side == "SELL" and slope >= 0) else 0.0
             except Exception:
                 pass
-            # ATR contracción: prox con std/true range if present; degradación suave
             try:
                 if "high" in df.columns and "low" in df.columns:
                     tr = (df["high"] - df["low"]).abs()
@@ -328,7 +291,6 @@ class SmartPositionManager:
                     f["atr_contract"] = 1.0 if change < -0.05 else (0.5 if change < 0 else 0.0)
             except Exception:
                 pass
-            # RSI básico
             try:
                 delta = df["close"].diff()
                 up = delta.clip(lower=0.0).rolling(14).mean()
@@ -343,7 +305,6 @@ class SmartPositionManager:
             except Exception:
                 pass
 
-        # Proximidad a S/R (en ATR)
         try:
             if side == "BUY" and resistance:
                 dist = max(0.0, resistance - close) / max(1e-9, atr)
@@ -366,17 +327,13 @@ class SmartPositionManager:
         pf = float(thr.get("partial_fraction", 0.50))
 
         if pnl_r >= p2_at:
-            return PMIDecision(ticket=0, symbol="", action=DecisionAction.PARTIAL_CLOSE,
-                               reason="ladder_partial2", fraction=pf)
+            return PMIDecision(0, "", DecisionAction.PARTIAL_CLOSE, "ladder_partial2", fraction=pf)
         if pnl_r >= p1_at:
-            return PMIDecision(ticket=0, symbol="", action=DecisionAction.PARTIAL_CLOSE,
-                               reason="ladder_partial1", fraction=pf)
+            return PMIDecision(0, "", DecisionAction.PARTIAL_CLOSE, "ladder_partial1", fraction=pf)
         if pnl_r >= tighten_at:
-            return PMIDecision(ticket=0, symbol="", action=DecisionAction.TIGHTEN_SL,
-                               reason="ladder_tighten")
+            return PMIDecision(0, "", DecisionAction.TIGHTEN_SL, "ladder_tighten")
         if pnl_r >= be_at:
-            return PMIDecision(ticket=0, symbol="", action=DecisionAction.TIGHTEN_SL,
-                               reason="ladder_break_even")
+            return PMIDecision(0, "", DecisionAction.TIGHTEN_SL, "ladder_break_even")
         return None
 
     def _weakness_decision(self, score: float) -> PMIDecision | None:
@@ -385,30 +342,16 @@ class SmartPositionManager:
         t_part = float(thr.get("partial", 0.70))
         t_close = float(thr.get("close", 0.85))
         if score >= t_close:
-            return PMIDecision(ticket=0, symbol="", action=DecisionAction.CLOSE,
-                               reason="weak_score_close", close_score=score)
+            return PMIDecision(0, "", DecisionAction.CLOSE, "weak_score_close", close_score=score)
         if score >= t_part:
-            return PMIDecision(ticket=0, symbol="", action=DecisionAction.PARTIAL_CLOSE,
-                               reason="weak_score_partial", close_score=score, fraction=float(
-                                   self.close_thresholds.get("ladder", {}).get("partial_fraction", 0.50)))
+            pf = float(self.close_thresholds.get("ladder", {}).get("partial_fraction", 0.50))
+            return PMIDecision(0, "", DecisionAction.PARTIAL_CLOSE, "weak_score_partial", close_score=score, fraction=pf)
         if score >= t_tight:
-            return PMIDecision(ticket=0, symbol="", action=DecisionAction.TIGHTEN_SL,
-                               reason="weak_score_tighten", close_score=score)
-        # adicional: reglas puras por TCD si se desean
-        tcd = self.close_thresholds.get("tcd", {})
-        tcd_tight = float(tcd.get("tighten", 0.55))
-        tcd_close = float(tcd.get("close", 0.70))
-        if score == score:  # evita NaN
-            pass
+            return PMIDecision(0, "", DecisionAction.TIGHTEN_SL, "weak_score_tighten", close_score=score)
         return None
 
     def _opposite_signal_decision(self, pos_side: str, sig_side: str, ml: float, lb90: float):
-        """
-        Señal opuesta con high-confidence puede forzar PARTIAL/CLOSE.
-        """
-        if sig_side not in ("BUY", "SELL") or pos_side not in ("BUY", "SELL"):
-            return None, ""
-        if sig_side == pos_side:
+        if sig_side not in ("BUY", "SELL") or pos_side not in ("BUY", "SELL") or sig_side == pos_side:
             return None, ""
         thr = self.close_thresholds
         if ml >= float(thr.get("opp_close_ml", 0.58)) and lb90 >= float(thr.get("opp_close_lb90", 0.53)):
@@ -418,25 +361,65 @@ class SmartPositionManager:
         return None, ""
 
     def _combine_actions(self, a: Optional[PMIDecision], b: Optional[PMIDecision]):
-        """
-        Selecciona la acción “más fuerte”.
-        CLOSE > PARTIAL > TIGHTEN > HOLD
-        """
         order = {DecisionAction.CLOSE: 3, DecisionAction.PARTIAL_CLOSE: 2,
                  DecisionAction.TIGHTEN_SL: 1, DecisionAction.HOLD: 0}
-
         cand = [x for x in (a, b) if x is not None]
         if not cand:
             return DecisionAction.HOLD, "hold", 0.0
         best = max(cand, key=lambda x: order.get(x.action, 0))
         return best.action, best.reason, best.fraction or 0.0
 
+    # ---------------- USD Targets ----------------
+    def _usd_target_decision(self, usd_pnl: float) -> Optional[PMIDecision]:
+        try:
+            up = float(self.usd_targets.get("usd_partial", 0))
+            uc = float(self.usd_targets.get("usd_close", 0))
+            pf = float(self.usd_targets.get("partial_fraction", 0.50))
+        except Exception:
+            up, uc, pf = 0.0, 0.0, 0.50
+
+        if uc > 0 and usd_pnl >= uc:
+            return PMIDecision(0, "", DecisionAction.CLOSE, f"usd_close_{uc:.0f}")
+        if up > 0 and usd_pnl >= up:
+            return PMIDecision(0, "", DecisionAction.PARTIAL_CLOSE, f"usd_partial_{up:.0f}", fraction=pf)
+        return None
+
+    def _estimate_unrealized_usd(
+        self, symbol: str, side: str, price_open: float, close: float,
+        volume: float, contract_size: float, point: float, usd_pppl: float
+    ) -> float:
+        """
+        Estimación simple de PnL en USD:
+        - Si viene usd_per_pip_per_lot en snapshot → usarlo (lo ideal).
+        - Si no, usar fórmulas estándar por par mayor:
+            * EURUSD/GBPUSD/AUDUSD: USD_PnL = (close - open) * 100000 * volume  (BUY; invertir signo para SELL)
+            * USDJPY: USD_PnL ≈ ((close - open) * 100000 * volume) / close      (BUY; invertir signo para SELL)
+        """
+        try:
+            sign = 1.0 if side == "BUY" else -1.0
+            delta = (close - price_open) * sign  # ya con el lado aplicado
+
+            if usd_pppl and point:
+                # si tenemos USD por pip por lote y el tamaño de punto
+                pips = delta / max(point, 1e-9)
+                return float(pips * usd_pppl * volume)
+
+            sym = symbol.upper()
+            if sym.endswith("USD") and len(sym) == 6:  # XXXUSD (EURUSD, GBPUSD, AUDUSD)
+                return float(delta * 100000.0 * volume)
+            if sym == "USDJPY":
+                # PnL en JPY = delta * 100000 * volume ; a USD ≈ / close
+                jpy_pnl = delta * 100000.0 * volume
+                return float(jpy_pnl / max(close, 1e-9))
+            # fallback genérico con contract_size (si vino)
+            return float(delta * max(contract_size, 100000.0) * volume)
+        except Exception:
+            return 0.0
+
     def _log(self, msg: str) -> None:
         try:
-            if self.logger:
-                self.logger.info(msg)
-            else:
-                print(msg)
+            if self.logger: self.logger.info(msg)
+            else: print(msg)
         except Exception:
             print(msg)
 

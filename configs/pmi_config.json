@@ -4,9 +4,12 @@
     "ladder": { "be_at": 0.30, "tighten_at": 0.60, "partial1_at": 1.00, "partial2_at": 1.50, "partial_fraction": 0.50 },
     "weak_score": { "tighten": 0.55, "partial": 0.70, "close": 0.85 },
     "tcd": { "tighten": 0.55, "close": 0.70 },
-    "opp_partial_ml": 0.55,
-    "opp_partial_lb90": 0.50,
-    "opp_close_ml": 0.58,
-    "opp_close_lb90": 0.53
+    "opp_partial_ml": 0.55, "opp_partial_lb90": 0.50,
+    "opp_close_ml": 0.58, "opp_close_lb90": 0.53
+  },
+  "profit_targets": {
+    "usd_partial": 300.0,
+    "usd_close": 500.0,
+    "partial_fraction": 0.50
   }
 }
