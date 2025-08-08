@@ -246,11 +246,9 @@ class SmartPositionManager:
             else:
                 final_action, reason, fraction = self._combine_actions(weak_dec, ladder_dec)
 
-            reported_action = final_action if self.mode == "active" else DecisionAction.HOLD
-
             out.append(PMIDecision(
                 ticket=ticket,
-                action=reported_action,
+                action=final_action,  # Registrar siempre la acción calculada
                 reason=reason,
                 confidence=weak_score,  # Using weak_score as confidence
                 close_score=weak_score,

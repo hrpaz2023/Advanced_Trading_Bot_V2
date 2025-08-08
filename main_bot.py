@@ -684,6 +684,135 @@ class OrchestratedMT5Bot:
         except Exception:
             pass
 
+
+    # =============================================================================
+    # AGREGAR ESTE MÉTODO A LA CLASE OrchestratedMT5Bot en main_bot.py
+    # Buscar alrededor de la línea 580 (después de otros métodos helper)
+    # =============================================================================
+
+    def _update_signal_context(self, symbol: str, signal_result: dict, extra_context: dict | None = None):
+        """
+        Extrae lado/ML/LB90/TCD de la señal detectada y lo guarda en self._last_signal_ctx[symbol].
+        Llamar SIEMPRE que haya señal (aprobada, rechazada o bloqueada).
+        """
+        try:
+            ctx = {}
+            
+            # ✅ Verificar que signal_result no sea None
+            if signal_result is None:
+                return
+                
+            # lado de la señal
+            side = signal_result.get("side") or signal_result.get("action") or signal_result.get("signal_side")
+            if side:
+                ctx["signal_side"] = str(side).upper()
+
+            # métricas de controller/ML
+            for k_src, k_dst in [
+                ("ml_confidence", "ml_confidence"),
+                ("historical_prob_lb90", "historical_prob_lb90"),
+                ("tcd_prob", "tcd_prob"),
+            ]:
+                v = signal_result.get(k_src)
+                if v is not None and v != "":
+                    try:
+                        ctx[k_dst] = float(v)
+                    except Exception:
+                        pass
+
+            # si el TCD vino en extra_context
+            if extra_context and "tcd" in extra_context:
+                try:
+                    tcd_prob = extra_context["tcd"].get("prob") or extra_context["tcd"].get("prob_tc")
+                    if tcd_prob is not None:
+                        ctx["tcd_prob"] = float(tcd_prob)
+                except Exception:
+                    pass
+
+            if ctx:
+                # Inicializar el diccionario si no existe
+                if not hasattr(self, '_last_signal_ctx'):
+                    self._last_signal_ctx = {}
+                self._last_signal_ctx[symbol] = ctx
+                
+                # Log del contexto actualizado
+                self.logger.debug(f"[{symbol}] Signal context updated: {ctx}")
+                
+        except Exception as e:
+            try:
+                self.logger.warning(f"_update_signal_context error: {e}")
+            except Exception:
+                print(f"_update_signal_context error: {e}")
+
+    # =============================================================================
+    # TAMBIÉN AGREGAR ESTE MÉTODO (si no existe) para aplicar decisiones PMI
+    # =============================================================================
+
+    def _apply_pmi_decision(self, decision: "PMIDecision", position: dict) -> None:
+        """
+        Aplica una decisión PMI si el bot está en modo activo.
+        """
+        if not getattr(self, "pmi_active", False):
+            self.logger.debug("PMI en modo observer - no aplicando decisión")
+            return  # modo observador
+
+        action = str(getattr(decision, 'action', '')).upper()
+        ticket = int(getattr(decision, 'ticket', 0))
+        symbol = str(position.get("symbol", ""))
+        volume = float(position.get("volume", 0.0))
+        
+        if not ticket or not symbol:
+            self.logger.warning(f"PMI: Datos insuficientes para aplicar decisión: ticket={ticket}, symbol={symbol}")
+            return
+
+        self.logger.info(f"PMI: Aplicando decisión {action} para #{ticket} {symbol}")
+
+        try:
+            tc = getattr(self, "trading_client", None) or getattr(self, "client", None)
+
+            if action == "CLOSE":
+                if tc and hasattr(tc, "close_position"):
+                    result = tc.close_position(ticket=ticket)
+                    self.logger.info(f"PMI: CLOSE ejecutado #{ticket} ({symbol}) - result: {result}")
+                else:
+                    self.logger.warning("PMI: TradingClient no tiene método close_position")
+
+            elif action == "PARTIAL_CLOSE":
+                partial_ratio = getattr(self, "pmi_partial_close_ratio", 0.5)
+                vol_to_close = max(0.01, round(volume * partial_ratio, 2))
+                
+                if tc and hasattr(tc, "partial_close"):
+                    result = tc.partial_close(ticket=ticket, volume=vol_to_close)
+                    self.logger.info(f"PMI: PARTIAL_CLOSE {vol_to_close} lotes #{ticket} ({symbol}) - result: {result}")
+                else:
+                    self.logger.warning("PMI: TradingClient no tiene método partial_close")
+
+            elif action == "TIGHTEN_SL":
+                if tc and hasattr(tc, "move_stop_to_be"):
+                    result = tc.move_stop_to_be(ticket=ticket)
+                    self.logger.info(f"PMI: TIGHTEN_SL → BE #{ticket} ({symbol}) - result: {result}")
+                else:
+                    self.logger.warning("PMI: TradingClient no tiene método move_stop_to_be")
+
+            # HOLD → no-op (ya logueado)
+            
+        except Exception as e:
+            self.logger.error(f"PMI: Error aplicando acción {action} #{ticket}: {e}")
+
+    # =============================================================================
+    # INSTRUCCIONES DE INSTALACIÓN:
+    # =============================================================================
+
+    """
+    1. Abre main_bot.py
+    2. Busca la línea ~580 (después de otros métodos helper como _verify_no_existing_position)
+    3. Agrega AMBOS métodos: _update_signal_context y _apply_pmi_decision
+    4. Guarda el archivo
+    5. Reinicia el bot: python main_bot.py
+
+    El error debería desaparecer y PMI debería funcionar correctamente.
+    """
+
     
     # --------- setup ---------
     def _load_json(self, path, name):
@@ -1012,8 +1141,7 @@ class OrchestratedMT5Bot:
     # ------------------------------------------------------------------
     def _fetch_candles(self, symbol: str, timeframe: str = "M5", n: int = 400):
         """
-        Devuelve un DataFrame con las últimas *n* velas del símbolo
-        y guarda un snapshot de las últimas 200 en data/candles/<símbolo>/.
+        VERSIÓN MEJORADA que siempre calcula ATR para PMI
         """
         try:
             if not MT5_AVAILABLE or not self.mt5_connected:
@@ -1029,37 +1157,64 @@ class OrchestratedMT5Bot:
 
             rates = mt5.copy_rates_from_pos(symbol, tf_const, 0, n)
 
-            # ✅ Validación segura para numpy arrays
             if rates is None or len(rates) == 0:
                 self.logger.warning(f"_fetch_candles: sin datos para {symbol}")
                 return None
 
             df = pd.DataFrame(rates)
-            # normalización de columnas
+            
+            # Normalización de columnas
             if "time" in df.columns:
                 df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
             if "tick_volume" in df.columns:
                 df.rename(columns={"tick_volume": "volume"}, inplace=True)
 
-            # ---------- Snapshot ----------
+            # ✅ GARANTIZAR ATR para PMI
+            if len(df) >= 14:  # ATR necesita al menos 14 períodos
+                if 'atr' not in df.columns:
+                    # Calcular ATR
+                    high = df['high']
+                    low = df['low'] 
+                    close = df['close']
+                    prev_close = close.shift(1)
+                    
+                    # True Range = max(high-low, abs(high-prev_close), abs(low-prev_close))
+                    tr1 = high - low
+                    tr2 = abs(high - prev_close)
+                    tr3 = abs(low - prev_close)
+                    
+                    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+                    atr = true_range.rolling(window=14).mean()  # ATR simple
+                    
+                    df['atr'] = atr.fillna(0.0)
+                    self.logger.debug(f"_fetch_candles: ATR calculado para {symbol}")
+                
+                # ATR relativo
+                if 'close' in df.columns:
+                    df['atr_rel'] = df['atr'] / df['close']
+                    df['atr_rel'] = df['atr_rel'].fillna(0.0)
+            else:
+                # Datos insuficientes - ATR = 0
+                df['atr'] = 0.0
+                df['atr_rel'] = 0.0
+                self.logger.warning(f"_fetch_candles: Datos insuficientes para ATR en {symbol} ({len(df)} velas)")
+
+            # Snapshot (sin cambios)
             try:
-                ts = dt.datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")  # ← sin utcnow()
+                ts = dt.datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
                 out_dir = Path("data") / "candles" / symbol
                 out_dir.mkdir(parents=True, exist_ok=True)
                 out_file = out_dir / f"{symbol}_{ts}.parquet"
                 df.tail(200).to_parquet(out_file, index=False)
                 self.logger.debug(f"Snapshot velas {symbol} → {out_file}")
             except Exception as e:
-                # no interrumpir si falla sólo el snapshot
                 self.logger.warning(f"No pude guardar snapshot velas {symbol}: {e}")
-            # ------------------------------
 
             return df
 
         except Exception as e:
             self.logger.error(f"_fetch_candles: error copiando velas {symbol}: {e}")
             return None
-
     # ------------------------------------------------------------------
     # PMI: recoger posiciones vivas desde TradingClient o MT5
     # ------------------------------------------------------------------
@@ -1151,48 +1306,138 @@ class OrchestratedMT5Bot:
     # ------------------------------------------------------------------
     # PMI: paso de integración por ciclo
     # ------------------------------------------------------------------
+# =============================================================================
+# SOLUCIÓN 1: Agregar logging verbose para verificar si PMI se está ejecutando
+# =============================================================================
+
+# En main_bot.py, REEMPLAZAR la función _pmi_integration_step completa:
+
     def _pmi_integration_step(self, candles_by_symbol: dict[str, "pd.DataFrame"]) -> None:
         """
-        1) Lee posiciones abiertas
-        2) Arma market_snapshot (close, atr_rel) usando velas si hay; si no, cae a tick MT5
-        3) Llama a PMI.evaluate(...)
-        4) Loguea decisiones y (si pmi_active) ejecuta acciones
+        VERSIÓN CORREGIDA con logging verbose y manejo robusto de datos
         """
+        timestamp_str = dt.datetime.now(timezone.utc).strftime("%H:%M:%S")
+        self.logger.info(f"🧠 PMI [{timestamp_str}]: === INTEGRATION STEP INICIADO ===")
+        
         # 1) posiciones vivas
         positions = self._collect_open_positions()
+        self.logger.info(f"🧠 PMI [{timestamp_str}]: Encontradas {len(positions)} posiciones abiertas")
+        
         if not positions:
+            self.logger.info(f"🧠 PMI [{timestamp_str}]: No hay posiciones, saltando evaluación")
             return
 
-        # 2) market_snapshot con fallback a tick
-        snapshot: dict[str, dict] = {}
+        # Debug detallado de posiciones
+        for i, pos in enumerate(positions):
+            ticket = pos.get('ticket', '?')
+            symbol = pos.get('symbol', '?')
+            volume = pos.get('volume', '?')
+            self.logger.info(f"🧠 PMI [{timestamp_str}]: Pos {i+1}: #{ticket} {symbol} vol={volume}")
 
-        # a) desde velas ya descargadas
+        # 2) market_snapshot MEJORADO
+        snapshot: dict[str, dict] = {}
+        
+        # a) desde velas ya descargadas (MEJORADO)
         for sym, df in (candles_by_symbol or {}).items():
             try:
+                if df is None or df.empty:
+                    self.logger.warning(f"🧠 PMI [{timestamp_str}]: DataFrame vacío para {sym}")
+                    continue
+                    
+                # Datos básicos
                 last_close = float(df["close"].iloc[-1])
-                atr_rel = float(df.get("atr_rel", pd.Series([0.0])).iloc[-1]) if isinstance(df, pd.DataFrame) else 0.0
-                snapshot[sym] = {"close": last_close, "atr_rel": atr_rel}
-            except Exception:
-                pass
+                
+                # ATR con fallback robusto
+                atr_value = 0.0
+                atr_rel = 0.0
+                
+                if 'atr' in df.columns and not df['atr'].isna().all():
+                    atr_value = float(df['atr'].iloc[-1])
+                    atr_rel = atr_value / last_close if last_close > 0 else 0.0
+                else:
+                    # Calcular ATR simple si no existe
+                    try:
+                        high = df['high'].rolling(14).max()
+                        low = df['low'].rolling(14).min()
+                        atr_simple = (high - low).iloc[-1] if len(df) >= 14 else (df['high'].iloc[-1] - df['low'].iloc[-1])
+                        atr_value = float(atr_simple) if not pd.isna(atr_simple) else 0.0
+                        atr_rel = atr_value / last_close if last_close > 0 and atr_value > 0 else 0.0
+                    except Exception:
+                        atr_value = 0.0
+                        atr_rel = 0.0
+                
+                # DATOS ADICIONALES para PMI
+                snapshot[sym] = {
+                    "close": last_close,
+                    "atr": atr_value,
+                    "atr_rel": atr_rel,
+                    "high": float(df["high"].iloc[-1]),
+                    "low": float(df["low"].iloc[-1]),
+                    "open": float(df["open"].iloc[-1]),
+                    "volume": float(df.get("volume", pd.Series([0.0])).iloc[-1]),
+                    "candles_count": len(df)
+                }
+                
+                self.logger.info(f"🧠 PMI [{timestamp_str}]: {sym} snapshot: close={last_close:.5f} atr={atr_value:.6f} atr_rel={atr_rel:.6f}")
+                
+            except Exception as e:
+                self.logger.error(f"🧠 PMI [{timestamp_str}]: Error procesando velas {sym}: {e}")
 
-        # b) fallback para símbolos en posiciones abiertas que no quedaron en snapshot
-        try:
-            import MetaTrader5 as mt5
-            for p in positions:
-                sym = str(p.get("symbol"))
-                if sym and sym not in snapshot:
+        # b) fallback para símbolos en posiciones que no tienen velas
+        missing_symbols = []
+        for p in positions:
+            sym = str(p.get("symbol", ""))
+            if sym and sym not in snapshot:
+                missing_symbols.append(sym)
+        
+        if missing_symbols:
+            self.logger.warning(f"🧠 PMI [{timestamp_str}]: Símbolos sin velas: {missing_symbols}")
+            
+            try:
+                import MetaTrader5 as mt5
+                for sym in missing_symbols:
                     tick = mt5.symbol_info_tick(sym)
                     if tick:
-                        # usa el precio relevante al lado de la posición si querés; aquí close ~ mid simple
                         mid = float((tick.bid + tick.ask) / 2.0) if tick.bid and tick.ask else float(tick.last or 0.0)
-                        snapshot[sym] = {"close": mid, "atr_rel": 0.0}
-        except Exception:
-            pass
+                        # Datos mínimos desde tick
+                        snapshot[sym] = {
+                            "close": mid,
+                            "atr": 0.0,  # No disponible desde tick
+                            "atr_rel": 0.0,
+                            "high": mid,
+                            "low": mid, 
+                            "open": mid,
+                            "volume": 0.0,
+                            "candles_count": 0
+                        }
+                        self.logger.info(f"🧠 PMI [{timestamp_str}]: Fallback tick {sym}: close={mid:.5f}")
+            except Exception as e:
+                self.logger.error(f"🧠 PMI [{timestamp_str}]: Error en fallback tick: {e}")
 
-# 3) evaluar con PMI (pasamos velas y contexto de señal para manejar señales opuestas)
+        self.logger.info(f"🧠 PMI [{timestamp_str}]: Market snapshot final: {len(snapshot)} símbolos")
+        
+        # Debug snapshot
+        for sym, data in snapshot.items():
+            close = data.get('close', 0)
+            atr = data.get('atr', 0)
+            candles = data.get('candles_count', 0)
+            self.logger.info(f"🧠 PMI [{timestamp_str}]: Snapshot {sym}: close={close:.5f} atr={atr:.6f} candles={candles}")
+
+        # 3) evaluar con PMI
         now_utc = dt.datetime.now(timezone.utc)
+        
         try:
-            # Evaluar decisiones PMI
+            self.logger.info(f"🧠 PMI [{timestamp_str}]: Llamando a self.pmi.evaluate()...")
+            
+            # Verificar PMI
+            if not hasattr(self, 'pmi') or self.pmi is None:
+                self.logger.error(f"❌ PMI [{timestamp_str}]: self.pmi es None!")
+                return
+                
+            pmi_mode = getattr(self.pmi, 'mode', 'unknown')
+            self.logger.info(f"🧠 PMI [{timestamp_str}]: PMI mode = {pmi_mode}")
+            
+            # Evaluar decisiones PMI con datos mejorados
             decisions = self.pmi.evaluate(
                 positions=positions,
                 market_snapshot=snapshot,
@@ -1201,88 +1446,55 @@ class OrchestratedMT5Bot:
                 signal_context_by_symbol=getattr(self, "_last_signal_ctx", {}),
             ) or []
             
+            self.logger.info(f"🧠 PMI [{timestamp_str}]: evaluate() retornó {len(decisions)} decisiones")
+            
             # 4) registrar y (opcional) ejecutar decisiones
-            for dec in decisions:
+            for i, dec in enumerate(decisions):
+                ticket = getattr(dec, 'ticket', '?')
+                action = getattr(dec, 'action', '?')
+                reason = getattr(dec, 'reason', '?')
+                confidence = getattr(dec, 'confidence', '?')
+                close_score = getattr(dec, 'close_score', '?')
+                
+                self.logger.info(f"🧠 PMI [{timestamp_str}]: Decisión {i+1}: #{ticket} {action} conf={confidence:.3f} score={close_score:.3f} reason={reason}")
+                
                 # Registrar decisión en logs
                 try:
-                    log_pmi_decision(dec)
+                    from pmi.logger import log_pmi_decision
+                    result = log_pmi_decision(dec)
+                    self.logger.info(f"🧠 PMI [{timestamp_str}]: log_pmi_decision({i+1}) = {result}")
+                    
+                    if not result:
+                        self.logger.warning(f"🧠 PMI [{timestamp_str}]: log_pmi_decision retornó False")
+                    
                 except Exception as e:
-                    self.logger.warning(f"PMI: no pude loguear decisión {dec}: {e}")
+                    self.logger.error(f"❌ PMI [{timestamp_str}]: Error guardando decisión {i+1}: {e}")
+                    import traceback
+                    self.logger.error(f"❌ PMI [{timestamp_str}]: Traceback: {traceback.format_exc()}")
                 
                 # Aplicar decisión si PMI está activo
-                if getattr(self, "pmi_active", False) and dec.action != DecisionAction.HOLD:
+                if getattr(self, "pmi_active", False):
                     try:
-                        # Buscar la posición correspondiente
-                        pos = next(
-                            (p for p in positions if int(p.get("ticket", 0)) == int(dec.ticket)), 
-                            None
-                        )
-                        
-                        if pos:
-                            self.logger.info(f"PMI: aplicando decisión {dec.action} para ticket {dec.ticket} - {dec.reason}")
-                            self._apply_pmi_decisions([dec], positions)
-                        else:
-                            self.logger.warning(f"PMI: no se encontró posición para ticket {dec.ticket}")
-                            
+                        action_name = getattr(action, 'name', str(action))
+                        if action_name not in ('HOLD', 'hold'):
+                            self.logger.info(f"🧠 PMI [{timestamp_str}]: Aplicando decisión activa {action_name}")
+                            # Buscar la posición correspondiente
+                            pos = next((p for p in positions if int(p.get("ticket", 0)) == int(ticket)), None)
+                            if pos:
+                                self._apply_pmi_decision(dec, pos)
+                            else:
+                                self.logger.warning(f"🧠 PMI [{timestamp_str}]: No se encontró posición para ticket {ticket}")
                     except Exception as e:
-                        self.logger.error(f"PMI: error aplicando decisión {dec.action} para ticket {dec.ticket}: {e}")
-                        # No reintentar automáticamente para evitar loops infinitos
-                        # En su lugar, registrar el error para investigación manual
-                        
-        except Exception as e:
-            self.logger.error(f"PMI: error en evaluación general: {e}")
-            # Opcional: desactivar PMI temporalmente si hay errores repetidos
-            # self.pmi_active = False
-
-
-    # === BEGIN: PMI SIGNAL CONTEXT UPDATER ===
-    def _update_signal_context(self, symbol: str, signal_result: dict, extra_context: dict | None = None):
-        """
-        Extrae lado/ML/LB90/TCD de la señal detectada y lo guarda en self._last_signal_ctx[symbol].
-        Llamar SIEMPRE que haya señal (aprobada, rechazada o bloqueada).
-        """
-        try:
-            ctx = {}
+                        self.logger.error(f"❌ PMI [{timestamp_str}]: Error aplicando decisión activa: {e}")
             
-            # ✅ FIX 3: Verificar que signal_result no sea None
-            if signal_result is None:
-                return
-                
-            # lado de la señal
-            side = signal_result.get("side") or signal_result.get("action") or signal_result.get("signal_side")
-            if side:
-                ctx["signal_side"] = str(side).upper()
-
-            # métricas de controller/ML
-            for k_src, k_dst in [
-                ("ml_confidence", "ml_confidence"),
-                ("historical_prob_lb90", "historical_prob_lb90"),
-                ("tcd_prob", "tcd_prob"),
-            ]:
-                v = signal_result.get(k_src)
-                if v is not None and v != "":
-                    try:
-                        ctx[k_dst] = float(v)
-                    except Exception:
-                        pass
-
-            # si el TCD vino en extra_context
-            if extra_context and "tcd" in extra_context:
-                try:
-                    tcd_prob = extra_context["tcd"].get("prob") or extra_context["tcd"].get("prob_tc")
-                    if tcd_prob is not None:
-                        ctx["tcd_prob"] = float(tcd_prob)
-                except Exception:
-                    pass
-
-            if ctx:
-                self._last_signal_ctx[symbol] = ctx
+            # Stats update
+            self.pmi_stats["evaluations"] += 1
+            self.logger.info(f"🧠 PMI [{timestamp_str}]: === INTEGRATION STEP COMPLETADO ===")
+                            
         except Exception as e:
-            try:
-                self.logger.warning(f"_update_signal_context error: {e}")
-            except Exception:
-                print(f"_update_signal_context error: {e}")
-    # === END: PMI SIGNAL CONTEXT UPDATER ===
+            self.logger.error(f"❌ PMI [{timestamp_str}]: Error en evaluación general: {e}")
+            import traceback
+            self.logger.error(f"❌ PMI [{timestamp_str}]: Traceback completo: {traceback.format_exc()}")
 
     # === BEGIN: PMI APPLY DECISIONS ===
     def _apply_pmi_decisions(self, decisions: list, open_positions: list):

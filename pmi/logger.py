@@ -1,133 +1,49 @@
 # pmi/logger.py
-from __future__ import annotations
-import sys
+import os
 import json
-from pathlib import Path
+import logging
 from dataclasses import asdict, is_dataclass
-import datetime as dt
-from datetime import timezone
-import enum
 
-# numpy / pandas son opcionales: solo si están instalados
+# Importaciones robustas para los enums y dataclasses
 try:
-    import numpy as np
-except Exception:
-    np = None  # type: ignore
-try:
-    import pandas as pd
-except Exception:
-    pd = None  # type: ignore
+    # Asumiendo que pmi es un paquete
+    from .decision import PMIDecision
+    from .enums import DecisionAction
+except ImportError:
+    # Fallback si la estructura es diferente o se ejecuta directamente
+    try:
+        from pmi.decision import PMIDecision
+        from pmi.enums import DecisionAction
+    except ImportError:
+        # Si no se encuentran, usamos placeholders para evitar que el programa crashee
+        # al importar, aunque el logging no funcionará completamente.
+        PMIDecision = type("PMIDecision", (), {})
+        DecisionAction = type("DecisionAction", (), {})
 
+logger = logging.getLogger("bot")
 
-def _to_serializable(obj):
-    """Convierte cualquier objeto común (dataclass, Enum, numpy/pandas, datetime) a JSON serializable."""
-    # None / primitivos
-    if obj is None or isinstance(obj, (str, bool, int, float)):
-        # sanea floats no válidos
-        if isinstance(obj, float):
-            if obj != obj or obj in (float('inf'), float('-inf')):
-                return None
-        return obj
-
-    # dataclass -> dict
+def _json_serializer(obj):
+    """Serializador JSON seguro que maneja enums y dataclasses."""
+    if isinstance(obj, DecisionAction):
+        return obj.name  # Convertir el enum a su nombre en string (ej: "CLOSE")
     if is_dataclass(obj):
-        obj = asdict(obj)
+        return asdict(obj)
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
-    # Enums
-    if isinstance(obj, enum.Enum):
-        # preferimos el nombre; si no, el valor
-        try:
-            return obj.name
-        except Exception:
-            return obj.value
-
-    # dict
-    if isinstance(obj, dict):
-        return {str(k): _to_serializable(v) for k, v in obj.items()}
-
-    # list/tuple/set
-    if isinstance(obj, (list, tuple, set)):
-        return [_to_serializable(x) for x in obj]
-
-    # datetime / date
-    if isinstance(obj, dt.datetime):
-        if obj.tzinfo is None:
-            obj = obj.replace(tzinfo=timezone.utc)
-        return obj.isoformat()
-    if isinstance(obj, dt.date):
-        return obj.isoformat()
-
-    # numpy
-    if np is not None:
-        if isinstance(obj, np.generic):
-            try:
-                return obj.item()
-            except Exception:
-                return float(obj) if hasattr(obj, "__float__") else str(obj)
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-
-    # pandas
-    if pd is not None:
-        if isinstance(obj, pd.Timestamp):
-            try:
-                # asegurar UTC
-                if obj.tz is None:
-                    obj = obj.tz_localize("UTC")
-                else:
-                    obj = obj.tz_convert("UTC")
-                return obj.to_pydatetime().isoformat()
-            except Exception:
-                return obj.isoformat()
-        if isinstance(obj, (pd.Series, pd.Index)):
-            return obj.tolist()
-
-    # fallback
+def log_pmi_decision(decision: PMIDecision, path: str = "logs/pmi_decisions.jsonl") -> bool:
+    logger.info(f"[DEBUG] Ejecutando log_pmi_decision para ticket={getattr(decision, 'ticket', None)} y acción={getattr(decision, 'action', None)}")
     try:
-        return str(obj)
-    except Exception:
-        return None
-
-
-def log_pmi_decision(decision, path: str = "logs/pmi_decisions.jsonl") -> bool:
-    """
-    Registra 1 línea JSON por decisión del PMI.
-    Acepta dataclass, dict u objetos con __dict__.
-    Devuelve True si escribe, False si falla.
-    """
-    try:
-        out = Path(path)
-        out.parent.mkdir(parents=True, exist_ok=True)
-
-        # Normalizamos el payload
-        if is_dataclass(decision):
-            payload = asdict(decision)
-        elif isinstance(decision, dict):
-            payload = dict(decision)
-        else:
-            # mejor esfuerzo: __dict__ o cast a str
-            try:
-                payload = dict(decision)
-            except Exception:
-                payload = vars(decision).copy() if hasattr(decision, "__dict__") else {"value": str(decision)}
-
-        # Timestamp ISO-UTC
-        payload["_ts_utc"] = dt.datetime.now(timezone.utc).isoformat()
-
-        # Serialización robusta
-        serializable = _to_serializable(payload)
-
-        with out.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(serializable, ensure_ascii=False) + "\n")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # Convertir el dataclass a un diccionario serializable
+        log_data = asdict(decision)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_data, default=_json_serializer, ensure_ascii=False) + "\n")
+        logger.info(f"[DEBUG] Registro exitoso en {path} para ticket={getattr(decision, 'ticket', None)}")
         return True
-
     except Exception as e:
-        # Log al stderr con detalle, y un intento mínimo de escritura
-        print(f"[PMI logger] ERROR al guardar '{path}': {e}", file=sys.stderr)
-        try:
-            minimal = {"_ts_utc": dt.datetime.now(timezone.utc).isoformat(), "error": str(e)}
-            with Path(path).open("a", encoding="utf-8") as f:
-                f.write(json.dumps(minimal, ensure_ascii=False) + "\n")
-            return True
-        except Exception:
-            return False
+        logger.error(f"\u274c Error al guardar log de decisi\u00f3n PMI en '{path}': {e}")
+        return False
+        return True
+    except Exception as e:
+        logger.error(f"❌ Error al guardar log de decisión PMI en '{path}': {e}")
+        return False
