@@ -11,5 +11,12 @@
     "usd_partial": 300.0,
     "usd_close": 500.0,
     "partial_fraction": 0.50
+  },
+  "hold_policy": {
+    "grace_minutes": 90,
+    "min_r_after_grace": 0.20,
+    "max_hours": 12,
+    "min_r_after_max": 0.30,
+    "partial_fraction": 0.50
   }
 }

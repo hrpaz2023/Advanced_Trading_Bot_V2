@@ -9,13 +9,10 @@ from typing import Any, Dict, List, Optional
 import datetime as dt
 
 try:
-    import pandas as pd  # solo si llegan velas
+    import pandas as pd
 except Exception:
     pd = None
 
-# ---------------------------------------------------------------------
-# Enums (usamos los tuyos si existen; si no, fallback local)
-# ---------------------------------------------------------------------
 try:
     from .enums import DecisionAction
 except Exception:
@@ -26,31 +23,25 @@ except Exception:
         CLOSE = "CLOSE"
 
 
-# ---------------------------------------------------------------------
-# Estructura de salida
-# ---------------------------------------------------------------------
 @dataclass
 class PMIDecision:
     ticket: int
     symbol: str
-    action: Any  # DecisionAction o str
+    action: Any       # DecisionAction o str
     reason: str
     close_score: float = 0.0
     fraction: float = 0.0
     telemetry: Optional[Dict[str, Any]] = None
 
 
-# ---------------------------------------------------------------------
-# SmartPositionManager
-# ---------------------------------------------------------------------
 class SmartPositionManager:
     """
-    PMI: decide TIGHTEN/PARTIAL/CLOSE combinando:
-    - Escalera basada en R (PnL/ATR aprox)
-    - Score de debilidad (TCD, slope EMA20, contracción ATR, RSI, proximidad S/R)
-    - Umbrales externos en configs/pmi_config.json
-    - S/R diarios desde configs/daily_sentiment_YYYYMMDD.json (opcional)
-    - OBJETIVOS EN USD POR TRADE (usd_partial, usd_close)
+    PMI (gestión inteligente de posiciones):
+      - Escalera por R (PnL/ATR).
+      - Score de debilidad (TCD, RSI, slope EMA, contracción ATR, proximidad S/R).
+      - Señal opuesta fuerte (ML + LB90).
+      - Objetivos en USD por trade (usd_partial / usd_close).
+      - **NUEVO**: Política de permanencia por tiempo (grace + máximo).
     """
 
     def __init__(
@@ -64,21 +55,20 @@ class SmartPositionManager:
         self.mode = (mode or "observer").lower()
         self.logger = logger
 
-        # 1) thresholds base
         cfg = self._load_pmi_config(pmi_config_path)
+
         if close_thresholds is None:
             close_thresholds = cfg.get("thresholds", {}) or {}
         self.close_thresholds = self._merge_thresholds(close_thresholds)
 
-        # 2) objetivos en USD por trade
         self.usd_targets = self._merge_usd_targets(cfg.get("profit_targets", {}))
+        self.hold_policy = self._merge_hold_policy(cfg.get("hold_policy", {}))
 
-        # 3) S/R diarios
         self.sr_levels = self._load_daily_sentiment(daily_sentiment_path)
 
-    # ---------------------------------------------------------
-    # PUBLIC API
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
+    # API
+    # ------------------------------------------------------------------
     def evaluate(
         self,
         positions: List[Dict[str, Any]],
@@ -87,27 +77,21 @@ class SmartPositionManager:
         now: Optional[dt.datetime] = None,
         signal_context_by_symbol: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> List[PMIDecision]:
-        """
-        Devuelve lista de decisiones PMI por posición abierta.
-        - positions: [{"ticket","symbol","type"(BUY/SELL),"volume","price_open","sl","tp"}]
-        - market_snapshot: {symbol: {"close":..., "atr":..., "atr_rel":..., "contract_size":..., "point":..., "pip":..., "usd_per_pip_per_lot":...}}
-        - candles_by_symbol: {symbol: df con ["time","open","high","low","close"]}
-        - signal_context_by_symbol: {symbol: {"signal_side","ml_confidence","historical_prob_lb90","tcd_prob", ...}}
-        """
         now = now or dt.datetime.now(dt.timezone.utc)
         out: List[PMIDecision] = []
 
         for pos in positions:
             symbol = str(pos.get("symbol", "")).upper()
             ticket = int(pos.get("ticket", 0))
-            side = str(pos.get("type", "")).upper()  # BUY/SELL
+            side = str(pos.get("type", "")).upper()
             vol = _num(pos.get("volume"))
             price_open = _num(pos.get("price_open"))
 
             if not symbol or side not in ("BUY", "SELL") or vol <= 0 or price_open <= 0:
                 continue
 
-            snap = market_snapshot.get(symbol, {}) if market_snapshot else {}
+            # ---------- snapshot ----------
+            snap = (market_snapshot or {}).get(symbol, {}) or {}
             close = _num(snap.get("close"))
             atr_abs = _num(snap.get("atr"))
             atr_rel = _num(snap.get("atr_rel"))
@@ -116,62 +100,66 @@ class SmartPositionManager:
 
             if close <= 0 or atr_abs <= 0:
                 out.append(PMIDecision(
-                    ticket=ticket, symbol=symbol,
-                    action=DecisionAction.HOLD, reason="insufficient_snapshot",
-                    telemetry={"have_close": close > 0, "have_open": price_open > 0, "have_atr": atr_abs > 0}
+                    ticket=ticket, symbol=symbol, action=DecisionAction.HOLD,
+                    reason="insufficient_snapshot",
+                    telemetry={"have_close": close > 0, "have_atr": atr_abs > 0, "have_open": price_open > 0}
                 ))
                 continue
 
-            # ========= PnL aproximado en R (ATR) y en USD =========
-            pnl_r = _pnl_r(side, price_open, close, atr_abs)
-            usd_pppl = _num(snap.get("usd_per_pip_per_lot"))  # si el main lo provee, perfecto
-            contract_size = _num(snap.get("contract_size"), 100_000.0)  # default FX lot
-            point = _num(snap.get("point"))  # tamaño de punto (tick)
-            usd_pnl = self._estimate_unrealized_usd(symbol, side, price_open, close, vol, contract_size, point, usd_pppl)
+            # ---------- tiempo en la posición ----------
+            opened_at = self._parse_open_time(pos)
+            hours_open = (now - opened_at).total_seconds() / 3600.0 if opened_at else 0.0
 
-            # ========= Contexto de señal reciente / TCD =========
+            # ---------- PnL en R y USD ----------
+            pnl_r = _pnl_r(side, price_open, close, atr_abs)
+            usd_pnl = self._estimate_unrealized_usd(
+                symbol=symbol, side=side, price_open=price_open, close=close,
+                volume=vol,
+                contract_size=_num(snap.get("contract_size"), 100_000.0),
+                point=_num(snap.get("point")),
+                usd_pppl=_num(snap.get("usd_per_pip_per_lot"))
+            )
+
+            # ---------- contexto de señal ----------
             ctx = (signal_context_by_symbol or {}).get(symbol, {}) if signal_context_by_symbol else {}
             ml = _num(ctx.get("ml_confidence"))
             lb90 = _num(ctx.get("historical_prob_lb90"))
             tcd_prob = _num(ctx.get("tcd_prob"))
             sig_side = (ctx.get("signal_side") or "").upper()
 
-            # ========= S/R diarios si existen =========
+            # ---------- S/R diarios ----------
             sr = (self.sr_levels.get(symbol) if self.sr_levels else {}) or {}
             support = _num(sr.get("support"))
             resistance = _num(sr.get("resistance"))
 
-            # ========= Debilidad del movimiento =========
-            deb_score, deb_factors = self._weakness_score(
+            # ---------- debilidad ----------
+            df_sym = (candles_by_symbol or {}).get(symbol) if candles_by_symbol else None
+            weak_score, weak_factors = self._weakness_score(
                 symbol=symbol, side=side, close=close, atr=atr_abs,
                 tcd_prob=tcd_prob, lb90=lb90, ml=ml, sig_side=sig_side,
                 support=support if support > 0 else None,
                 resistance=resistance if resistance > 0 else None,
-                df=(candles_by_symbol or {}).get(symbol) if candles_by_symbol else None,
+                df=df_sym,
             )
 
-            # ========= 1) Regla por objetivos USD (tiene prioridad) =========
-            usd_decision = self._usd_target_decision(usd_pnl)
-
-            # ========= 2) Escalera R-based =========
-            ladder_decision = self._ladder_decision(pnl_r)
-
-            # ========= 3) Debilidad técnica =========
-            weakness_decision = self._weakness_decision(deb_score)
-
-            # ========= 4) Señal opuesta fuerte =========
+            # ---------- reglas ----------
+            usd_dec = self._usd_target_decision(usd_pnl)
+            ladder_dec = self._ladder_decision(pnl_r)
+            weak_dec = self._weakness_decision(weak_score)
+            time_dec = self._time_based_decision(hours_open, pnl_r, weak_score)
             opp_action, opp_reason = self._opposite_signal_decision(side, sig_side, ml, lb90)
 
-            # Combinar (prioridad: opp > usd > weakness > ladder > hold)
+            # prioridad: opp > usd > time > weak > ladder > hold
             final_action, reason, fraction = DecisionAction.HOLD, "hold", 0.0
             if opp_action is not None:
                 final_action, reason = opp_action, opp_reason
-            elif usd_decision is not None:
-                final_action, reason, fraction = usd_decision.action, usd_decision.reason, usd_decision.fraction or 0.0
+            elif usd_dec is not None:
+                final_action, reason, fraction = usd_dec.action, usd_dec.reason, usd_dec.fraction or 0.0
+            elif time_dec is not None:
+                final_action, reason, fraction = time_dec.action, time_dec.reason, time_dec.fraction or 0.0
             else:
-                final_action, reason, fraction = self._combine_actions(weakness_decision, ladder_decision)
+                final_action, reason, fraction = self._combine_actions(weak_dec, ladder_dec)
 
-            # Modo observador -> reporta HOLD
             reported_action = final_action if self.mode == "active" else DecisionAction.HOLD
 
             out.append(PMIDecision(
@@ -179,12 +167,13 @@ class SmartPositionManager:
                 symbol=symbol,
                 action=reported_action,
                 reason=reason,
-                close_score=deb_score,
+                close_score=weak_score,
                 fraction=fraction,
                 telemetry={
+                    "hours_open": round(hours_open, 3),
                     "usd_pnl": usd_pnl,
                     "r_pnl": pnl_r,
-                    "factors": deb_factors,
+                    "factors": weak_factors,
                     "ml": ml, "lb90": lb90, "tcd": tcd_prob,
                     "pos_side": side, "sig_side": sig_side,
                     "sr_support": support if support > 0 else None,
@@ -194,22 +183,22 @@ class SmartPositionManager:
 
         return out
 
-    # ---------------------------------------------------------
-    # Internals
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Config / loaders
+    # ------------------------------------------------------------------
     def _load_pmi_config(self, path: str) -> Dict[str, Any]:
-        defaults = {"mode": "active", "thresholds": {}, "profit_targets": {}}
+        base = {"mode": "active", "thresholds": {}, "profit_targets": {}, "hold_policy": {}}
         try:
             p = Path(path)
-            if not p.exists():
-                self._log(f"PMI config no encontrado: {path}. Uso defaults.")
-                return defaults
-            with p.open("r", encoding="utf-8") as f:
-                cfg = json.load(f) or {}
-            return cfg
+            if p.exists():
+                with p.open("r", encoding="utf-8") as f:
+                    data = json.load(f) or {}
+                return {**base, **data}
+            self._log(f"PMI config no encontrado: {path}. Uso defaults.")
+            return base
         except Exception as e:
             self._log(f"PMI config inválido ({path}): {e}. Uso defaults.")
-            return defaults
+            return base
 
     def _merge_thresholds(self, user_thr: Dict[str, Any]) -> Dict[str, Any]:
         d = {
@@ -222,7 +211,7 @@ class SmartPositionManager:
         try:
             u = dict(user_thr or {})
             for k in ("ladder", "weak_score", "tcd"):
-                if k in u and isinstance(u[k], dict):
+                if isinstance(u.get(k), dict):
                     d[k].update(u[k])
             for k in ("opp_partial_ml", "opp_partial_lb90", "opp_close_ml", "opp_close_lb90"):
                 if k in u: d[k] = float(u[k])
@@ -234,29 +223,45 @@ class SmartPositionManager:
         d = {"usd_partial": 300.0, "usd_close": 500.0, "partial_fraction": 0.50}
         try:
             if isinstance(user, dict):
-                for k in d.keys():
-                    if k in user:
-                        d[k] = float(user[k])
+                for k in list(d.keys()):
+                    if k in user: d[k] = float(user[k])
+        except Exception:
+            pass
+        return d
+
+    def _merge_hold_policy(self, user: Dict[str, Any]) -> Dict[str, Any]:
+        d = {
+            "grace_minutes": 90,
+            "min_r_after_grace": 0.20,
+            "max_hours": 20,
+            "min_r_after_max": 0.30,
+            "partial_fraction": 0.50
+        }
+        try:
+            if isinstance(user, dict):
+                for k in list(d.keys()):
+                    if k in user: d[k] = float(user[k])
         except Exception:
             pass
         return d
 
     def _load_daily_sentiment(self, sentiment_path: Optional[str]) -> Dict[str, Dict[str, float]]:
         try:
-            p = None
             if sentiment_path:
                 p = Path(sentiment_path)
             else:
                 today = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d")
                 p = Path(f"configs/daily_sentiment_{today}.json")
+
             if not p.exists():
                 self._log(f"Daily sentiment no encontrado ({p}). S/R no disponibles.")
                 return {}
+
             with p.open("r", encoding="utf-8") as f:
                 data = json.load(f) or {}
-            pairs = data.get("pairs", {}) or {}
+
             out = {}
-            for sym, vals in pairs.items():
+            for sym, vals in (data.get("pairs") or {}).items():
                 out[str(sym).upper()] = {
                     "support": _num((vals or {}).get("support")),
                     "resistance": _num((vals or {}).get("resistance")),
@@ -267,7 +272,9 @@ class SmartPositionManager:
             self._log(f"Daily sentiment inválido: {e}. S/R no disponibles.")
             return {}
 
-    # --------- Cálculos de score / escalera / señal opuesta ----------
+    # ------------------------------------------------------------------
+    # Decisiones
+    # ------------------------------------------------------------------
     def _weakness_score(self, symbol, side, close, atr, tcd_prob, lb90, ml, sig_side,
                         support, resistance, df):
         weights = {"tcd": 0.40, "slope": 0.20, "atr_contract": 0.15, "rsi_exit": 0.15, "sr_near": 0.10}
@@ -350,6 +357,24 @@ class SmartPositionManager:
             return PMIDecision(0, "", DecisionAction.TIGHTEN_SL, "weak_score_tighten", close_score=score)
         return None
 
+    def _time_based_decision(self, hours_open: float, pnl_r: float, weak_score: float) -> PMIDecision | None:
+        hp = self.hold_policy
+        grace_h = float(hp.get("grace_minutes", 90)) / 60.0
+        min_r_grace = float(hp.get("min_r_after_grace", 0.20))
+        max_h = float(hp.get("max_hours", 20))
+        min_r_max = float(hp.get("min_r_after_max", 0.30))
+        pf = float(hp.get("partial_fraction", 0.50))
+
+        # Si pasó el máximo y el trade no despegó o está débil → cierre
+        if hours_open >= max_h and (pnl_r < min_r_max or weak_score >= 0.55):
+            return PMIDecision(0, "", DecisionAction.CLOSE, "time_max_hold")
+
+        # Si pasó el grace y sigue bajo rendimiento con debilidad → parcial
+        if hours_open >= grace_h and pnl_r < min_r_grace and weak_score >= 0.50:
+            return PMIDecision(0, "", DecisionAction.PARTIAL_CLOSE, "time_underperforming", fraction=pf)
+
+        return None
+
     def _opposite_signal_decision(self, pos_side: str, sig_side: str, ml: float, lb90: float):
         if sig_side not in ("BUY", "SELL") or pos_side not in ("BUY", "SELL") or sig_side == pos_side:
             return None, ""
@@ -369,14 +394,11 @@ class SmartPositionManager:
         best = max(cand, key=lambda x: order.get(x.action, 0))
         return best.action, best.reason, best.fraction or 0.0
 
-    # ---------------- USD Targets ----------------
+    # ---------------- Objetivos en USD ----------------
     def _usd_target_decision(self, usd_pnl: float) -> Optional[PMIDecision]:
-        try:
-            up = float(self.usd_targets.get("usd_partial", 0))
-            uc = float(self.usd_targets.get("usd_close", 0))
-            pf = float(self.usd_targets.get("partial_fraction", 0.50))
-        except Exception:
-            up, uc, pf = 0.0, 0.0, 0.50
+        up = float(self.usd_targets.get("usd_partial", 0.0))
+        uc = float(self.usd_targets.get("usd_close", 0.0))
+        pf = float(self.usd_targets.get("partial_fraction", 0.50))
 
         if uc > 0 and usd_pnl >= uc:
             return PMIDecision(0, "", DecisionAction.CLOSE, f"usd_close_{uc:.0f}")
@@ -388,51 +410,68 @@ class SmartPositionManager:
         self, symbol: str, side: str, price_open: float, close: float,
         volume: float, contract_size: float, point: float, usd_pppl: float
     ) -> float:
-        """
-        Estimación simple de PnL en USD:
-        - Si viene usd_per_pip_per_lot en snapshot → usarlo (lo ideal).
-        - Si no, usar fórmulas estándar por par mayor:
-            * EURUSD/GBPUSD/AUDUSD: USD_PnL = (close - open) * 100000 * volume  (BUY; invertir signo para SELL)
-            * USDJPY: USD_PnL ≈ ((close - open) * 100000 * volume) / close      (BUY; invertir signo para SELL)
-        """
         try:
             sign = 1.0 if side == "BUY" else -1.0
-            delta = (close - price_open) * sign  # ya con el lado aplicado
+            delta = (close - price_open) * sign
 
             if usd_pppl and point:
-                # si tenemos USD por pip por lote y el tamaño de punto
                 pips = delta / max(point, 1e-9)
                 return float(pips * usd_pppl * volume)
 
             sym = symbol.upper()
-            if sym.endswith("USD") and len(sym) == 6:  # XXXUSD (EURUSD, GBPUSD, AUDUSD)
+            if sym.endswith("USD") and len(sym) == 6:
                 return float(delta * 100000.0 * volume)
             if sym == "USDJPY":
-                # PnL en JPY = delta * 100000 * volume ; a USD ≈ / close
                 jpy_pnl = delta * 100000.0 * volume
                 return float(jpy_pnl / max(close, 1e-9))
-            # fallback genérico con contract_size (si vino)
             return float(delta * max(contract_size, 100000.0) * volume)
         except Exception:
             return 0.0
 
+    # ------------------------------------------------------------------
+    # Utilidades
+    # ------------------------------------------------------------------
+    def _parse_open_time(self, pos: Dict[str, Any]) -> Optional[dt.datetime]:
+        """
+        Intenta leer la hora de apertura de la posición en varios formatos:
+        - pos['time'] / ['open_time'] / ['time_open'] (datetime o str ISO)  (preferido)
+        - pos['time_msc'] (epoch ms)
+        Devuelve timezone-aware (UTC) o None.
+        """
+        candidates = ["time", "open_time", "time_open"]
+        for k in candidates:
+            val = pos.get(k)
+            if isinstance(val, dt.datetime):
+                return val if val.tzinfo else val.replace(tzinfo=dt.timezone.utc)
+            if isinstance(val, str):
+                try:
+                    d = dt.datetime.fromisoformat(val.replace("Z", "+00:00"))
+                    return d if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
+                except Exception:
+                    pass
+        tms = pos.get("time_msc")
+        if isinstance(tms, (int, float)) and tms > 0:
+            try:
+                return dt.datetime.fromtimestamp(float(tms) / 1000.0, tz=dt.timezone.utc)
+            except Exception:
+                return None
+        return None
+
     def _log(self, msg: str) -> None:
         try:
-            if self.logger: self.logger.info(msg)
-            else: print(msg)
+            if self.logger:
+                self.logger.info(msg)
+            else:
+                print(msg)
         except Exception:
             print(msg)
 
 
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
+# ----------------------------- helpers -----------------------------
 def _num(x: Any, default: float = 0.0) -> float:
     try:
         v = float(x)
-        if v == v:
-            return v
-        return default
+        return v if v == v else default
     except Exception:
         return default
 
@@ -440,7 +479,4 @@ def _num(x: Any, default: float = 0.0) -> float:
 def _pnl_r(side: str, price_open: float, close: float, atr: float) -> float:
     if atr <= 0:
         return 0.0
-    if side == "BUY":
-        return (close - price_open) / atr
-    else:
-        return (price_open - close) / atr
+    return (close - price_open) / atr if side == "BUY" else (price_open - close) / atr
