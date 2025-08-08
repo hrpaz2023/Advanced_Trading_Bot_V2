@@ -177,8 +177,7 @@ class SmartPositionManager:
 
             if close <= 0 or atr_abs <= 0:
                 out.append(PMIDecision(
-                    ticket=ticket,
-                    action=DecisionAction.HOLD,
+                    ticket=ticket, symbol=symbol, action=DecisionAction.HOLD,
                     reason="insufficient_snapshot",
                     telemetry={"have_close": close > 0, "have_atr": atr_abs > 0, "have_open": price_open > 0}
                 ))
@@ -250,12 +249,12 @@ class SmartPositionManager:
 
             out.append(PMIDecision(
                 ticket=ticket,
+                symbol=symbol,
                 action=reported_action,
                 reason=reason,
-                confidence=weak_score,  # Using weak_score as confidence
                 close_score=weak_score,
+                fraction=fraction,
                 telemetry={
-                    "symbol": symbol,
                     "hours_open": round(hours_open, 3),
                     "usd_pnl": usd_pnl,
                     "r_pnl": pnl_r,
@@ -264,25 +263,15 @@ class SmartPositionManager:
                     "pos_side": side, "sig_side": sig_side,
                     "sr_support": support if support > 0 else None,
                     "sr_resistance": resistance if resistance > 0 else None,
-                    "fraction": fraction,
                 }
             ))
 
         return out
 
     # =========================
-    # Helper class for internal decision tracking
-    # =========================
-    class _InternalDecision:
-        def __init__(self, action: DecisionAction, reason: str, fraction: float = 0.0):
-            self.action = action
-            self.reason = reason
-            self.fraction = fraction
-
-    # =========================
     # Reglas
     # =========================
-    def _usd_target_decision(self, usd_pnl: float) -> Optional['SmartPositionManager._InternalDecision']:
+    def _usd_target_decision(self, usd_pnl: float) -> Optional[PMIDecision]:
         tgts = [float(x) for x in self.usd_targets.get("targets", [])]
         fracs = [float(x) for x in self.usd_targets.get("fractions", [])]
         if not tgts or not fracs:
@@ -292,26 +281,26 @@ class SmartPositionManager:
             if usd_pnl >= t:
                 frac = fracs[i] if i < len(fracs) else 1.0
                 action = DecisionAction.CLOSE if frac >= 1.0 or i == len(tgts) - 1 else DecisionAction.PARTIAL_CLOSE
-                return self._InternalDecision(action=action, reason=f"usd_target_{t:g}", fraction=frac)
+                return PMIDecision(ticket=0, symbol="", action=action, reason=f"usd_target_{t:g}", fraction=frac)
         return None
 
-    def _ladder_decision(self, r: float) -> Optional['SmartPositionManager._InternalDecision']:
+    def _ladder_decision(self, r: float) -> Optional[PMIDecision]:
         close_r = float(self.thresholds.get("ladder_close_r", 1.5))
         part_r = float(self.thresholds.get("ladder_partial_r", 1.0))
         if r >= close_r:
-            return self._InternalDecision(action=DecisionAction.CLOSE, reason="ladder_close")
+            return PMIDecision(ticket=0, symbol="", action=DecisionAction.CLOSE, reason="ladder_close")
         if r >= part_r:
-            return self._InternalDecision(action=DecisionAction.PARTIAL_CLOSE, reason="ladder_partial", fraction=0.5)
+            return PMIDecision(ticket=0, symbol="", action=DecisionAction.PARTIAL_CLOSE, reason="ladder_partial", fraction=0.5)
         return None
 
-    def _weakness_decision(self, w: float) -> Optional['SmartPositionManager._InternalDecision']:
+    def _weakness_decision(self, w: float) -> Optional[PMIDecision]:
         if w >= float(self.thresholds.get("weak_close", 0.70)):
-            return self._InternalDecision(action=DecisionAction.CLOSE, reason="weakness_strong")
+            return PMIDecision(ticket=0, symbol="", action=DecisionAction.CLOSE, reason="weakness_strong")
         if w >= float(self.thresholds.get("weak_partial", 0.60)):
-            return self._InternalDecision(action=DecisionAction.PARTIAL_CLOSE, reason="weakness_medium", fraction=0.5)
+            return PMIDecision(ticket=0, symbol="", action=DecisionAction.PARTIAL_CLOSE, reason="weakness_medium", fraction=0.5)
         return None
 
-    def _time_based_decision(self, hours_open: float, r: float, w: float) -> Optional['SmartPositionManager._InternalDecision']:
+    def _time_based_decision(self, hours_open: float, r: float, w: float) -> Optional[PMIDecision]:
         hp = self.hold_policy or {}
         grace_h = float(hp.get("grace_minutes", 90.0)) / 60.0
         max_h = float(hp.get("max_hours", 12.0))
@@ -320,10 +309,10 @@ class SmartPositionManager:
         part_frac = float(hp.get("partial_fraction", 0.50))
 
         if hours_open >= max_h and r < min_r_max:
-            return self._InternalDecision(action=DecisionAction.CLOSE, reason="time_limit_max_hours")
+            return PMIDecision(ticket=0, symbol="", action=DecisionAction.CLOSE, reason="time_limit_max_hours")
 
         if hours_open >= grace_h and r < min_r_grace and w >= float(self.thresholds.get("weak_partial", 0.60)):
-            return self._InternalDecision(action=DecisionAction.PARTIAL_CLOSE, reason="time_grace_underperf", fraction=part_frac)
+            return PMIDecision(ticket=0, symbol="", action=DecisionAction.PARTIAL_CLOSE, reason="time_grace_underperf", fraction=part_frac)
 
         return None
 
@@ -333,7 +322,7 @@ class SmartPositionManager:
         weak_score: float,
         usd_pnl: float,
         volume: float
-    ) -> Optional['SmartPositionManager._InternalDecision']:
+    ) -> Optional[PMIDecision]:
         hp = self.hold_policy or {}
         if not bool(hp.get("breakeven_enabled", True)):
             return None
@@ -346,9 +335,12 @@ class SmartPositionManager:
         needed_usd = max(0.0, (volume * c_per_lot) + extra)
 
         if hours_open >= after_h and weak_score >= weak_thr and usd_pnl >= needed_usd:
-            return self._InternalDecision(
+            return PMIDecision(
+                ticket=0,
+                symbol="",
                 action=DecisionAction.CLOSE,
-                reason="breakeven_on_weakness"
+                reason="breakeven_on_weakness",
+                telemetry={"commission_needed": needed_usd}
             )
         return None
 
@@ -371,8 +363,8 @@ class SmartPositionManager:
 
     def _combine_actions(
         self,
-        a: Optional['SmartPositionManager._InternalDecision'],
-        b: Optional['SmartPositionManager._InternalDecision'],
+        a: Optional[PMIDecision],
+        b: Optional[PMIDecision],
     ) -> Tuple[DecisionAction, str, float]:
         # ranking de fuerza: CLOSE > PARTIAL > TIGHTEN_SL > HOLD
         rank = {

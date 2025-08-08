@@ -1,22 +1,37 @@
 {
   "mode": "active",
+  "lb90_min": 0.25, 
   "thresholds": {
-    "ladder": { "be_at": 0.30, "tighten_at": 0.60, "partial1_at": 1.00, "partial2_at": 1.50, "partial_fraction": 0.50 },
-    "weak_score": { "tighten": 0.55, "partial": 0.70, "close": 0.85 },
-    "tcd": { "tighten": 0.55, "close": 0.70 },
-    "opp_partial_ml": 0.55, "opp_partial_lb90": 0.50,
-    "opp_close_ml": 0.58, "opp_close_lb90": 0.53
+    "opp_strong_ml": 0.65,
+    "opp_strong_lb90": 0.55,
+    "opp_medium_ml": 0.55,
+    "opp_medium_lb90": 0.45,
+    "weak_close": 0.70,
+    "weak_partial": 0.60,
+    "ladder_partial_r": 1.00,
+    "ladder_close_r": 1.50
   },
-  "profit_targets": {
-    "usd_partial": 300.0,
-    "usd_close": 500.0,
-    "partial_fraction": 0.50
+  "usd_targets": {
+    "targets": [150.0, 350.0, 600.0],
+    "fractions": [0.50, 0.50, 1.00]
   },
   "hold_policy": {
     "grace_minutes": 90,
     "min_r_after_grace": 0.20,
     "max_hours": 12,
     "min_r_after_max": 0.30,
-    "partial_fraction": 0.50
+    "partial_fraction": 0.50,
+
+    "breakeven_enabled": true,
+    "breakeven_after_minutes": 60,
+    "breakeven_weak_threshold": 0.55,
+    "commission_per_lot": 3.0,
+    "breakeven_extra_buffer": 0.0
+  },
+  "sr_levels": {
+    "EURUSD": { "support": 1.1600, "resistance": 1.1710 },
+    "GBPUSD": { "support": 1.3350, "resistance": 1.3500 },
+    "AUDUSD": { "support": 0.6480, "resistance": 0.6535 },
+    "USDJPY": { "support": 146.40, "resistance": 147.90 }
   }
 }

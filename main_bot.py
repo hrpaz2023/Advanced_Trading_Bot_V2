@@ -357,119 +357,107 @@ class ControllerSpec:
 # ---------- BOT ----------
 class OrchestratedMT5Bot:
     def __init__(
-        self,
-        config_path: str = "configs/global_config.json",
-        risk_path: str = "configs/risk_config.json",
-        orch_cfg_path: str = "orchestrator_config.json",
-        insights_path: str = "reports/global_insights.json",
-        base_lots: float = 0.10,
-        cycle_seconds: int = 30,
-        symbols: list[str] | None = None,
-        time_frame: str = "M5",
-        logger: logging.Logger | None = None,
-        # --- PMI opcional ---
-        pmi: SmartPositionManager | None = None,
-        trend_detector: TrendChangeDetector | None = None,
-        # --- Flags PMI ---
-        pmi_active: bool = False,
-        pmi_partial_close_ratio: float = 0.5,
-        pmi_active_symbols: Optional[List[str]] | None = None,
-        **kwargs,
-    ):
-        """Constructor con soporte PMI opcional."""
-        os.environ.setdefault("OMP_NUM_THREADS", "1")
-        os.environ.setdefault("MKL_NUM_THREADS", "1")
+            self,
+            config_path: str = "configs/global_config.json",
+            risk_path: str = "configs/risk_config.json",
+            orch_cfg_path: str = "orchestrator_config.json",
+            insights_path: str = "reports/global_insights.json",
+            base_lots: float = 0.10,
+            cycle_seconds: int = 30,
+            symbols: list[str] | None = None,
+            time_frame: str = "M5",
+            logger: logging.Logger | None = None,
+            # --- PMI opcional ---
+            pmi: SmartPositionManager | None = None,
+            trend_detector: TrendChangeDetector | None = None,
+            # --- Flags PMI ---
+            pmi_active: bool = False,
+            pmi_partial_close_ratio: float = 0.5,
+            pmi_active_symbols: Optional[List[str]] | None = None,
+            **kwargs,
+        ):
+            """Constructor con soporte PMI opcional."""
+            os.environ.setdefault("OMP_NUM_THREADS", "1")
+            os.environ.setdefault("MKL_NUM_THREADS", "1")
 
-        # Logger
-        self.logger = logger or setup_logging()
+            # Logger
+            self.logger = logger or setup_logging()
 
-        # Config básicos
-        self.symbols = symbols or ["EURUSD", "GBPUSD", "AUDUSD", "USDJPY"]
-        self.time_frame = time_frame
-        self.base_lots = base_lots
-        self.cycle_seconds = cycle_seconds
-        self.stop_event = threading.Event()
+            # Config básicos
+            self.symbols = symbols or ["EURUSD", "GBPUSD", "AUDUSD", "USDJPY"]
+            self.time_frame = time_frame
+            self.base_lots = base_lots
+            self.cycle_seconds = cycle_seconds
+            self.stop_event = threading.Event()
+            
+            # ✅ FIX 1: Cargar configuración PMI TEMPRANO, antes de cualquier otra inicialización
+            self.pmi_config_path = "configs/pmi_config.json"
+            pmi_cfg = self._load_pmi_config()  # Esto debe ir ANTES de _load_pmi()
 
-        # ✅ FIX: Inicializar TODOS los stats necesarios TEMPRANO
-        self.stats = {
-            "signals_generated": 0,
-            "signals_approved": 0,
-            "signals_executed": 0,
-            "signals_rejected": 0,
-            "signals_rejected_by_controller": 0,
-            "positions_blocked": 0,
-            "signals_blocked_by_position": 0,    # ← Key missing fix
-            "signals_blocked_by_news": 0,
-            "signals_blocked_by_risk": 0,
-            "execution_errors": 0,               # ← Key missing fix
-            "news_blocks": 0,                    # ← Key missing fix
-        }
+            # ✅ FIX 2: Inicializar PMI con la configuración correcta TEMPRANO
+            try:
+                self.pmi = SmartPositionManager.from_config(pmi_cfg)
+                self.pmi_mode = self.pmi.mode  # "active" | "observer"
+                self.pmi_active = (self.pmi_mode == "active")
+                self.logger.info(f"✅ PMI inicializado en modo: {self.pmi_mode}")
+            except Exception as e:
+                self.logger.error(f"❌ Error inicializando PMI: {e}")
+                # Fallback seguro
+                self.pmi = SmartPositionManager(mode="observer")
+                self.pmi_mode = "observer"
+                self.pmi_active = False
 
-        # ✅ FIX 2: Inicializar trend_change_detector TEMPRANO
-        try:
-            self.trend_change_detector = TrendChangeDetector() if TrendChangeDetector else None
-        except Exception:
-            self.trend_change_detector = None
+            # ✅ FIX 3: Inicializar TODOS los stats necesarios TEMPRANO
+            self.stats = {
+                "signals_generated": 0,
+                "signals_approved": 0,
+                "signals_executed": 0,
+                "signals_rejected": 0,
+                "signals_rejected_by_controller": 0,
+                "positions_blocked": 0,
+                "signals_blocked_by_position": 0,
+                "signals_blocked_by_news": 0,
+                "signals_blocked_by_risk": 0,
+                "execution_errors": 0,
+                "news_blocks": 0,
+            }
 
-        # Cargar config PMI desde JSON
-        pmi_cfg = self._load_pmi_config()
+            # ✅ FIX 4: Inicializar trend_change_detector TEMPRANO
+            try:
+                self.trend_change_detector = TrendChangeDetector() if TrendChangeDetector else None
+            except Exception:
+                self.trend_change_detector = None
 
-        # PMI (Position Management Intelligence)
-        try:
-            self.pmi = SmartPositionManager(
-                mode=pmi_cfg.get("mode", "active"),
-                close_thresholds=pmi_cfg.get("thresholds", None),
-            )
-        except Exception:
-            # fallback por si cambió la firma
-            self.pmi = SmartPositionManager()
+            # Contexto de la última señal por símbolo (para "señal opuesta" y TCD)
+            self._last_signal_ctx = {}
 
-        # Flag: ¿aplicamos acciones del PMI?
-        self.pmi_active = (getattr(self.pmi, "mode", "observer") == "active")
+            # Telemetría PMI
+            self.pmi_stats = {
+                "evaluations": 0,
+                "close_signals": 0,
+                "partial_close": 0,
+                "tighten_sl": 0,
+            }
 
-        # Contexto de la última señal por símbolo (para "señal opuesta" y TCD)
-        self._last_signal_ctx = {}
+            # Carga de configs y setup de subsistemas (ajusta según tus helpers)
+            self.global_cfg = self._load_json(config_path, "global_config")
+            self.risk_cfg = self._load_json(risk_path, "risk_config")
+            self.timeframe = self.global_cfg.get("timeframe", "M5")
 
-        # Telemetría PMI
-        self.pmi_stats = {
-            "evaluations": 0,
-            "close_signals": 0,
-            "partial_close": 0,
-            "tighten_sl": 0,
-        }
+            self.notifier = self._setup_notifier()
+            self.news_filter = self._setup_news_filter()
 
-        # Contadores de señales del loop (para banners/logs)
-        self.stats = {
-            "signals_generated": 0,
-            "signals_approved": 0,
-            "signals_executed": 0,
-            "positions_blocked": 0,
-            "signals_rejected": 0,               # <-- faltaba
-            "signals_rejected_by_controller": 0  # útil si diferenciás rechazos del controller
-        }
+            self.mt5_connected = init_mt5_from_config(self.global_cfg, self.logger)
+            self.client = self._setup_trading_client()
 
-        # Si querés sincronizar lb90_min con los controllers, hacelo donde instancias controllers,
-        # leyendo pmi_cfg["lb90_min"] y pasándolo a cada controlador como parámetro.
-        # ---------------------------------------------------------------
+            self.policy = PolicySwitcher(config_path=orch_cfg_path, global_insights_path=insights_path)
+            self.controllers = self._build_controllers()
+            self.cycle_mgr = OptimizedM5CycleManager()
+            self._setup_signals()
 
-        # Carga de configs y setup de subsistemas (ajusta según tus helpers)
-        self.global_cfg = self._load_json(config_path, "global_config")
-        self.risk_cfg = self._load_json(risk_path, "risk_config")
-        self.timeframe = self.global_cfg.get("timeframe", "M5")
-
-        self.notifier = self._setup_notifier()
-        self.news_filter = self._setup_news_filter()
-
-        self.mt5_connected = init_mt5_from_config(self.global_cfg, self.logger)
-        self.client = self._setup_trading_client()
-
-        self.policy = PolicySwitcher(config_path=orch_cfg_path, global_insights_path=insights_path)
-        self.controllers = self._build_controllers()
-        self.cycle_mgr = OptimizedM5CycleManager()
-        self._setup_signals()
-
-        self.logger.info("✅ Bot MT5 orquestado inicializado con control de posiciones.")
-        self._print_startup_summary()
+            # ✅ FIX 5: El banner de startup ahora se imprime DESPUÉS de que todo esté inicializado
+            self.logger.info("✅ Bot MT5 orquestado inicializado con control de posiciones.")
+            self._print_startup_summary()
 
     def _load_pmi_config(self, path: str = "configs/pmi_config.json") -> dict:
         """
@@ -482,42 +470,75 @@ class OrchestratedMT5Bot:
         }
         """
         defaults = {
-            "mode": "active",
+            "mode": "active",  # ✅ Cambiar default a "active" para que coincida con tu config
             "thresholds": {
-                "tighten_sl": 0.70,
-                "partial_close": 0.82,
-                "close": 0.90,
-                "tcd_tighten": 0.55,
-                "tcd_close": 0.70,
-                "opp_partial_ml": 0.55,
-                "opp_partial_lb90": 0.50,
-                "opp_close_ml": 0.58,
-                "opp_close_lb90": 0.53,
-                "partial_fraction": 0.50
+                "opp_strong_ml": 0.65,
+                "opp_strong_lb90": 0.55,
+                "opp_medium_ml": 0.55,
+                "opp_medium_lb90": 0.45,
+                "weak_close": 0.70,
+                "weak_partial": 0.60,
+                "ladder_partial_r": 1.00,
+                "ladder_close_r": 1.50
+            },
+            "usd_targets": {
+                "targets": [150.0, 350.0, 600.0],
+                "fractions": [0.50, 0.50, 1.00]
+            },
+            "hold_policy": {
+                "grace_minutes": 90,
+                "min_r_after_grace": 0.20,
+                "max_hours": 12,
+                "min_r_after_max": 0.30,
+                "partial_fraction": 0.50,
+                "breakeven_enabled": True,
+                "breakeven_after_minutes": 60,
+                "breakeven_weak_threshold": 0.55,
+                "commission_per_lot": 3.0,
+                "breakeven_extra_buffer": 0.0
             },
             "lb90_min": 0.25
         }
+        
         try:
             p = Path(path)
             if not p.exists():
-                self.logger.warning(f"PMI config no encontrado: {path}. Uso defaults.")
+                self.logger.warning(f"PMI config no encontrado: {path}. Usando defaults con modo 'active'.")
                 return defaults
+                
             with p.open("r", encoding="utf-8") as f:
                 cfg = json.load(f) or {}
+                
             # merge superficial (mantiene defaults si faltan llaves)
             out = dict(defaults)
             out["mode"] = str(cfg.get("mode", defaults["mode"])).lower()
+            
+            # Merge thresholds
             thr = dict(defaults["thresholds"])
             thr.update(cfg.get("thresholds", {}) or {})
             out["thresholds"] = thr
+            
+            # Merge usd_targets
+            usd = dict(defaults["usd_targets"])
+            usd.update(cfg.get("usd_targets", {}) or {})
+            out["usd_targets"] = usd
+            
+            # Merge hold_policy
+            hp = dict(defaults["hold_policy"])
+            hp.update(cfg.get("hold_policy", {}) or {})
+            out["hold_policy"] = hp
+            
+            # Other settings
             out["lb90_min"] = float(cfg.get("lb90_min", defaults["lb90_min"]))
-            self.logger.info(f"✅ pmi_config cargado: {path}")
+            
+            self.logger.info(f"✅ PMI config cargado desde {path} - modo: {out['mode']}")
             return out
+            
         except Exception as e:
             try:
-                self.logger.warning(f"PMI config inválido ({path}): {e}. Uso defaults.")
+                self.logger.warning(f"PMI config inválido ({path}): {e}. Usando defaults con modo 'active'.")
             except Exception:
-                print(f"PMI config inválido ({path}): {e}. Uso defaults.")
+                print(f"PMI config inválido ({path}): {e}. Usando defaults con modo 'active'.")
             return defaults
 
     def _inc_stat(self, key: str, n: int = 1) -> None:
@@ -628,20 +649,58 @@ class OrchestratedMT5Bot:
             print(f"\n🔒 CONTROL DE POSICIONES: ACTIVADO")
             print("   • Prevención de múltiples posiciones por símbolo")
             print("   • Verificación en tiempo real con MT5")
-            pmi_mode = getattr(self, "pmi", None)
-            pmi_mode_txt = getattr(pmi_mode, "mode", "unknown") if pmi_mode else "disabled"
-            lb90_min = getattr(getattr(self, "controllers", [None])[0], "lb90_min", 0.25) if self.controllers else 0.25
+
+            # === PMI banner real ===
+            pmi_mode_txt = getattr(getattr(self, "pmi", None), "mode", "disabled")
+            # LB90 desde el primer controller que lo tenga, o fallback fijo
+            lb90_min = 0.25
+            if getattr(self, "controllers", None):
+                first = self.controllers[0]
+                lb90_min = getattr(first, "lb90_min", getattr(self, "LB90_MIN", 0.25))
+            else:
+                lb90_min = getattr(self, "LB90_MIN", 0.25)
+
             print(f"\n🧠 PMI: modo={pmi_mode_txt} | LB90_min={lb90_min:.2f}")
             print("="*80 + "\n")
         except Exception as e:
             print(f"⚠️ No se pudo imprimir el resumen de configuración: {e}")
 
+        # === Detalle de thresholds/targets/breakeven (sin crashear si falta algo) ===
         try:
-            thr = getattr(self.pmi, "close_thresholds", {})
-            print(f"\n🧠 PMI: modo={getattr(self.pmi,'mode','unknown')} | LB90_min={pmi_cfg.get('lb90_min',0.25):.2f}")
-            print(f"   • Umbrales: close={thr.get('close'):.2f} partial={thr.get('partial_close'):.2f} tighten={thr.get('tighten_sl'):.2f} | tcd_close={thr.get('tcd_close'):.2f}")
+            if getattr(self, "pmi", None):
+                thr = getattr(self.pmi, "thresholds", {}) or {}
+                usd = getattr(self.pmi, "usd_targets", {}) or {}
+                hp  = getattr(self.pmi, "hold_policy", {}) or {}
+
+                # thresholds clave
+                opp_s = (thr.get("opp_strong_ml"), thr.get("opp_strong_lb90"))
+                opp_m = (thr.get("opp_medium_ml"), thr.get("opp_medium_lb90"))
+                weak_close = thr.get("weak_close")
+                weak_partial = thr.get("weak_partial")
+                lad_part = thr.get("ladder_partial_r")
+                lad_close = thr.get("ladder_close_r")
+
+                print("🧠 PMI detalles:")
+                print(f"   • Señal opuesta: strong ML/LB90={opp_s[0]:.2f}/{opp_s[1]:.2f} | medium ML/LB90={opp_m[0]:.2f}/{opp_m[1]:.2f}")
+                print(f"   • Debilidad: close={weak_close:.2f} | partial={weak_partial:.2f}")
+                print(f"   • Ladder por R: partial={lad_part:.2f} | close={lad_close:.2f}")
+
+                tgts = usd.get("targets", [])
+                fras = usd.get("fractions", [])
+                if tgts and fras:
+                    pairs = ", ".join(f"{t:g}@{min(1.0, float(f)):.2f}" for t, f in zip(tgts, fras))
+                    print(f"   • Targets USD: {pairs}")
+
+                if hp:
+                    be_on = bool(hp.get("breakeven_enabled", True))
+                    be_min = float(hp.get("breakeven_after_minutes", 60))
+                    be_w   = float(hp.get("breakeven_weak_threshold", 0.55))
+                    be_com = float(hp.get("commission_per_lot", 3.0))
+                    be_buf = float(hp.get("breakeven_extra_buffer", 0.0))
+                    print(f"   • Break-even: enabled={be_on} after={be_min:.0f}m weak≥{be_w:.2f} comm/lot={be_com:.2f} buffer={be_buf:.2f}")
         except Exception:
             pass
+
     
     # --------- setup ---------
     def _load_json(self, path, name):
@@ -1147,9 +1206,10 @@ class OrchestratedMT5Bot:
         except Exception:
             pass
 
-        # 3) evaluar con PMI (pasamos velas y contexto de señal para manejar señales opuestas)
+# 3) evaluar con PMI (pasamos velas y contexto de señal para manejar señales opuestas)
         now_utc = dt.datetime.now(timezone.utc)
         try:
+            # Evaluar decisiones PMI
             decisions = self.pmi.evaluate(
                 positions=positions,
                 market_snapshot=snapshot,
@@ -1157,35 +1217,39 @@ class OrchestratedMT5Bot:
                 now=now_utc,
                 signal_context_by_symbol=getattr(self, "_last_signal_ctx", {}),
             ) or []
-        except TypeError:
-            # si tu versión de PMI no acepta signal_context_by_symbol aún
-            decisions = self.pmi.evaluate(
-                positions=positions,
-                market_snapshot=snapshot,
-                candles_by_symbol=candles_by_symbol,
-                now=now_utc,
-            ) or []
-
-        # 4) registrar y (opcional) ejecutar
-        try:
-            from pmi.logger import log_pmi_decision
-        except Exception:
-            def log_pmi_decision(*args, **kwargs):
-                return False  # fallback silencioso
-
-        for dec in decisions:
-            try:
-                log_pmi_decision(dec)
-            except Exception as e:
-                self.logger.warning(f"PMI: no pude loguear decisión {dec}: {e}")
-
-            if getattr(self, "pmi_active", False):
+            
+            # 4) registrar y (opcional) ejecutar decisiones
+            for dec in decisions:
+                # Registrar decisión en logs
                 try:
-                    pos = next((p for p in positions if int(p.get("ticket")) == int(dec.ticket)), None)
-                    if pos:
-                        self._apply_pmi_decisions([dec], positions)
+                    log_pmi_decision(dec)
                 except Exception as e:
-                    self.logger.error(f"PMI: error aplicando decisión {dec}: {e}")
+                    self.logger.warning(f"PMI: no pude loguear decisión {dec}: {e}")
+                
+                # Aplicar decisión si PMI está activo
+                if getattr(self, "pmi_active", False) and dec.action != DecisionAction.HOLD:
+                    try:
+                        # Buscar la posición correspondiente
+                        pos = next(
+                            (p for p in positions if int(p.get("ticket", 0)) == int(dec.ticket)), 
+                            None
+                        )
+                        
+                        if pos:
+                            self.logger.info(f"PMI: aplicando decisión {dec.action} para ticket {dec.ticket} - {dec.reason}")
+                            self._apply_pmi_decisions([dec], positions)
+                        else:
+                            self.logger.warning(f"PMI: no se encontró posición para ticket {dec.ticket}")
+                            
+                    except Exception as e:
+                        self.logger.error(f"PMI: error aplicando decisión {dec.action} para ticket {dec.ticket}: {e}")
+                        # No reintentar automáticamente para evitar loops infinitos
+                        # En su lugar, registrar el error para investigación manual
+                        
+        except Exception as e:
+            self.logger.error(f"PMI: error en evaluación general: {e}")
+            # Opcional: desactivar PMI temporalmente si hay errores repetidos
+            # self.pmi_active = False
 
 
     # === BEGIN: PMI SIGNAL CONTEXT UPDATER ===

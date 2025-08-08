@@ -1,55 +1,92 @@
-# src/tools/pmi_smoketest.py
+# -*- coding: utf-8 -*-
+"""
+Smoke-test rápido de SmartPositionManager:
+- Señal opuesta fuerte -> CLOSE
+- Señal opuesta media -> PARTIAL_CLOSE
+- Debilidad fuerte por TCD -> CLOSE
+- NUEVO: Break-even por debilidad -> CLOSE si cubre comisión
+"""
+from __future__ import annotations
 import datetime as dt
+
 from pmi.smart_position_manager import SmartPositionManager
+from pmi.enums import DecisionAction
 
-def main():
-    now = dt.datetime.now(dt.timezone.utc)
+# --- Config mínima de prueba (puedes cargar desde configs/pmi_config.json en tu entorno) ---
+cfg = {
+    "mode": "active",
+    "thresholds": {
+        "opp_strong_ml": 0.65,
+        "opp_strong_lb90": 0.55,
+        "opp_medium_ml": 0.55,
+        "opp_medium_lb90": 0.45,
+        "weak_close": 0.70,
+        "weak_partial": 0.60,
+        "ladder_partial_r": 1.00,
+        "ladder_close_r": 1.50,
+    },
+    "usd_targets": {
+        "targets": [150.0, 350.0, 600.0],
+        "fractions": [0.50, 0.50, 1.00]
+    },
+    "hold_policy": {
+        "grace_minutes": 90,
+        "min_r_after_grace": 0.20,
+        "max_hours": 12,
+        "min_r_after_max": 0.30,
+        "partial_fraction": 0.50,
 
-    # Instanciamos PMI en modo activo (usa tus umbrales por defecto)
-    pmi = SmartPositionManager(mode="active")
-
-    # Posiciones ficticias (no usa MT5)
-    positions = [
-        {"ticket": 111, "symbol": "EURUSD", "type": "BUY",  "volume": 2.0, "price_open": 1.12345},
-        {"ticket": 222, "symbol": "USDJPY", "type": "SELL", "volume": 2.0, "price_open": 147.200},
-        {"ticket": 333, "symbol": "AUDUSD", "type": "BUY",  "volume": 2.0, "price_open": 0.65200},
-    ]
-
-    # Snapshot simple (close/atr_rel) – suficiente para el combine() y factores
-    market_snapshot = {
-        "EURUSD": {"close": 1.12400, "atr_rel": 0.010},
-        "USDJPY": {"close": 147.000, "atr_rel": 0.020},
-        "AUDUSD": {"close": 0.65180, "atr_rel": 0.015},
+        # NUEVO
+        "breakeven_enabled": True,
+        "breakeven_after_minutes": 60,
+        "breakeven_weak_threshold": 0.55,
+        "commission_per_lot": 3.0,
+        "breakeven_extra_buffer": 0.0
+    },
+    "sr_levels": {
+        "EURUSD": {"support": 1.1600, "resistance": 1.1710}
     }
+}
 
-    # Contexto de señales por símbolo:
-    # - EURUSD: señal opuesta fuerte → debería disparar CLOSE
-    # - USDJPY: señal opuesta media → debería disparar PARTIAL
-    # - AUDUSD: TCD alto (>= tcd_close 0.70) → debería disparar CLOSE por TCD
-    signal_context_by_symbol = {
-        "EURUSD": {"signal_side": "SELL", "ml_confidence": 0.66, "historical_prob_lb90": 0.58, "tcd_prob": 0.40},
-        "USDJPY": {"signal_side": "BUY",  "ml_confidence": 0.59, "historical_prob_lb90": 0.53, "tcd_prob": 0.40},
-        "AUDUSD": {"signal_side": "SELL", "ml_confidence": 0.40, "historical_prob_lb90": 0.40, "tcd_prob": 0.72},
+spm = SmartPositionManager.from_config(cfg)
+
+# ----- Datos sintéticos -----
+now = dt.datetime.now(dt.timezone.utc)
+
+positions = [
+    {"ticket": 111, "symbol": "EURUSD", "type": "BUY", "volume": 1.0, "price_open": 1.1600, "time": (now - dt.timedelta(hours=2)).timestamp()},
+    {"ticket": 222, "symbol": "EURUSD", "type": "SELL", "volume": 1.0, "price_open": 1.1700, "time": (now - dt.timedelta(hours=1.5)).timestamp()},
+    {"ticket": 333, "symbol": "EURUSD", "type": "BUY", "volume": 1.0, "price_open": 1.1650, "time": (now - dt.timedelta(hours=3)).timestamp()},
+    {"ticket": 444, "symbol": "EURUSD", "type": "BUY", "volume": 2.0, "price_open": 1.1650, "time": (now - dt.timedelta(hours=1.2)).timestamp()},  # BE case
+]
+
+snapshot = {
+    "EURUSD": {
+        "close": 1.1656,
+        "atr": 0.0006,
+        "contract_size": 100000,
+        "point": 0.0001,
+        "usd_per_pip_per_lot": 10.0,
     }
+}
 
-    # Ejecutamos evaluación: no envía órdenes, solo devuelve decisiones
-    decisions = pmi.evaluate(
-        positions=positions,
-        market_snapshot=market_snapshot,
-        candles_by_symbol=None,
-        now=now,
-        signal_context_by_symbol=signal_context_by_symbol,
-    )
+# contexto de señales
+ctx = {
+    "EURUSD": {
+        "signal_side": "SELL",         # opuesta a BUY
+        "ml_confidence": 0.66,
+        "historical_prob_lb90": 0.58,
+        "tcd_prob": 0.40
+    }
+}
 
-    print("\n=== PMI SMOKE-TEST ===")
-    for d in decisions:
-        # d es un PMIDecision; tratamos de imprimir bonito
-        ticket = getattr(d, "ticket", None) or d.get("ticket")
-        action = str(getattr(d, "action", None) or d.get("action"))
-        reason = getattr(d, "reason", "") or d.get("reason", "")
-        close_score = getattr(d, "close_score", None) or d.get("close_score", 0.0)
-        telemetry = getattr(d, "telemetry", {}) or d.get("telemetry", {})
-        print(f"ticket={ticket} action={action} reason={reason} close_score={close_score:.3f} meta={telemetry}")
+decisions = spm.evaluate(positions, snapshot, signal_context_by_symbol=ctx, now=now)
 
-if __name__ == "__main__":
-    main()
+for d in decisions:
+    print(f"ticket={d.ticket} action={d.action} reason={d.reason} close_score={round(d.close_score or 0.0, 3)} meta={d.telemetry}")
+
+# Esperado:
+# - 111 -> CLOSE (opposite strong)
+# - 222 -> PARTIAL (opposite medium) [en este set podría salir HOLD si no cruza umbrales, es sintético]
+# - 333 -> CLOSE (weakness alta simulada por S/R + TCD + opposite)
+# - 444 -> CLOSE (breakeven_on_weakness) si el usd_pnl >= comisión (2 lotes * 3 USD = 6 USD)
