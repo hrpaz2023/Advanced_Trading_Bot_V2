@@ -390,30 +390,29 @@ class OrchestratedMT5Bot:
         self.cycle_seconds = cycle_seconds
         self.stop_event = threading.Event()
 
-        # ✅ FIX 1: Inicializar stats TEMPRANO
-        # Contadores de señales del loop (para banners/logs)
+        # ✅ FIX: Inicializar TODOS los stats necesarios TEMPRANO
         self.stats = {
             "signals_generated": 0,
             "signals_approved": 0,
             "signals_executed": 0,
             "signals_rejected": 0,
-            "positions_blocked": 0,              # si lo usás en algún lado
-            "signals_blocked_by_position": 0,    # <-- faltaba
-            "signals_blocked_by_news": 0,        # opcional
-            "signals_blocked_by_risk": 0         # opcional
+            "signals_rejected_by_controller": 0,
+            "positions_blocked": 0,
+            "signals_blocked_by_position": 0,    # ← Key missing fix
+            "signals_blocked_by_news": 0,
+            "signals_blocked_by_risk": 0,
+            "execution_errors": 0,               # ← Key missing fix
+            "news_blocks": 0,                    # ← Key missing fix
         }
 
-
-        # ✅ FIX 2: Inicializar trend_change_detector
-# ---------- PMI & TCD: instancia, buffers y contadores ----------
-        # Trend-Change Detector (para prob. de giro por símbolo)
+        # ✅ FIX 2: Inicializar trend_change_detector TEMPRANO
         try:
             self.trend_change_detector = TrendChangeDetector() if TrendChangeDetector else None
         except Exception:
             self.trend_change_detector = None
 
         # Cargar config PMI desde JSON
-        pmi_cfg = self._load_pmi_config()  # {"mode": "...", "thresholds": {...}, "lb90_min": ...}
+        pmi_cfg = self._load_pmi_config()
 
         # PMI (Position Management Intelligence)
         try:
@@ -428,8 +427,8 @@ class OrchestratedMT5Bot:
         # Flag: ¿aplicamos acciones del PMI?
         self.pmi_active = (getattr(self.pmi, "mode", "observer") == "active")
 
-        # Contexto de la última señal por símbolo (para “señal opuesta” y TCD)
-        self._last_signal_ctx = {}  # {"EURUSD": {"signal_side":"BUY","ml_confidence":0.66,"historical_prob_lb90":0.58,"tcd_prob":0.61}, ...}
+        # Contexto de la última señal por símbolo (para "señal opuesta" y TCD)
+        self._last_signal_ctx = {}
 
         # Telemetría PMI
         self.pmi_stats = {
@@ -527,7 +526,41 @@ class OrchestratedMT5Bot:
         except Exception:
             self.stats[key] = self.stats.get(key, 0)
 
+    # Add these helper methods to the OrchestratedMT5Bot class
 
+    def _inc_stat(self, key: str, n: int = 1) -> None:
+        """Safely increment a statistic, initializing if not exists."""
+        try:
+            if key not in self.stats:
+                self.stats[key] = 0
+            self.stats[key] = int(self.stats.get(key, 0)) + int(n)
+        except Exception as e:
+            self.logger.warning(f"Error incrementing stat {key}: {e}")
+            self.stats[key] = self.stats.get(key, 0)
+
+    def _get_stat(self, key: str, default: int = 0) -> int:
+        """Safely get a statistic value."""
+        return self.stats.get(key, default)
+
+    def _ensure_all_stats_exist(self):
+        """Ensure all required stats keys exist with default values."""
+        required_stats = {
+            "signals_generated": 0,
+            "signals_approved": 0,
+            "signals_executed": 0,
+            "signals_rejected": 0,
+            "signals_rejected_by_controller": 0,
+            "positions_blocked": 0,
+            "signals_blocked_by_position": 0,
+            "signals_blocked_by_news": 0,
+            "signals_blocked_by_risk": 0,
+            "execution_errors": 0,
+            "news_blocks": 0,
+        }
+        
+        for key, default_value in required_stats.items():
+            if key not in self.stats:
+                self.stats[key] = default_value
 
     def _print_startup_summary(self):
         import os, json
@@ -1403,7 +1436,13 @@ class OrchestratedMT5Bot:
 
     # --------- loop ---------
     def run(self):
+        """Complete run method with all fixes applied"""
+        
+        # Ensure all stats exist at the start
+        self._ensure_all_stats_exist()
+        
         self.logger.info("🚀 Iniciando loop principal (CycleManager M5 + Control de Posiciones)...")
+        
         while not self.stop_event.is_set():
             try:
                 # Evaluación rápida (observador) al inicio del ciclo
@@ -1432,16 +1471,30 @@ class OrchestratedMT5Bot:
 
                         # ② TCD (trend change)
                         try:
-                            tcd_out = self.trend_change_detector.estimate_probability(df)
-                            prob_tc = float(tcd_out.get("probability", 0.0))
-                            tcd_details = {k: v for k, v in tcd_out.items() if k != "probability"}
-                            self.logger.info(f"[{c.symbol}] TCD prob={prob_tc:.3f} details={tcd_details}")
+                            if self.trend_change_detector:
+                                tcd_out = self.trend_change_detector.estimate_probability(df)
+                                prob_tc = float(tcd_out.get("probability", 0.0))
+                                tcd_details = {k: v for k, v in tcd_out.items() if k != "probability"}
+                                self.logger.info(f"[{c.symbol}] TCD prob={prob_tc:.3f} details={tcd_details}")
+                            else:
+                                prob_tc = 0.0
+                                tcd_details = {}
                         except Exception as e:
                             self.logger.warning(f"[{c.symbol}] TCD error: {e}")
                             prob_tc = 0.0
                             tcd_details = {}
 
-                        # ③ Señal + contexto extra
+                        # ③ Verificar filtro de noticias temprano
+                        try:
+                            if self._news_blocks(c.symbol):
+                                news_blocked = True
+                                self._inc_stat("signals_blocked_by_news")
+                                self.logger.info(f"🚫 [{c.symbol}] Bloqueado por noticias")
+                                continue
+                        except Exception as e:
+                            self.logger.warning(f"Error verificando filtro de noticias para {c.symbol}: {e}")
+
+                        # ④ Señal + contexto extra
                         extra_context = {
                             "tcd_prob": prob_tc,
                             "tcd": tcd_details,
@@ -1457,6 +1510,7 @@ class OrchestratedMT5Bot:
 
                             # ───────── Filtro posición abierta (bot-level) ─────────
                             if not self._verify_no_existing_position(c.symbol):
+                                position_blocked = True
                                 signal_data["status"] = "blocked_position"
                                 signal_data["rejection_reason"] = "Open position"
 
@@ -1477,7 +1531,10 @@ class OrchestratedMT5Bot:
                                     "position_size": 0,
                                     "ticket": "",
                                 })
-                                self.stats["signals_blocked_by_position"] += 1
+                                
+                                # ✅ FIX: Use safe increment method
+                                self._inc_stat("signals_blocked_by_position")
+                                
                                 print(format_signal_output(
                                     c.symbol, c.strategy_name, signal_data,
                                     verdict=None, execution_result=None,
@@ -1491,7 +1548,7 @@ class OrchestratedMT5Bot:
 
                             if signal_data and signal_data.get("action"):
                                 had_signal = True
-                                self.stats["signals_generated"] += 1
+                                self._inc_stat("signals_generated")
 
                                 if status == "rejected" and rejection_reason:
                                     self._inc_stat("signals_rejected")
@@ -1543,7 +1600,7 @@ class OrchestratedMT5Bot:
 
                             execution_result = None
                             if verdict["approved"] and verdict["position_size"] > 0:
-                                self.stats["signals_approved"] += 1
+                                self._inc_stat("signals_approved")
                                 log_data.update({
                                     "status": "approved",
                                     "rejection_reason": "",
@@ -1555,8 +1612,6 @@ class OrchestratedMT5Bot:
                                 if not self._verify_no_existing_position(c.symbol):
                                     self.logger.error(f"🔒 [{c.symbol}] EJECUCIÓN CANCELADA: Posición detectada en verificación final")
                                     self._inc_stat("signals_blocked_by_position")
-                                    f"| Pos❌: {self.stats.get('signals_blocked_by_position', 0)} "
-                                    self.stats["signals_blocked_by_position"] += 1
                                     log_data.update({
                                         "status": "position_blocked",
                                         "rejection_reason": "Posición existente (verificación final)",
@@ -1568,7 +1623,7 @@ class OrchestratedMT5Bot:
                                 execution_result = res
                                 if res and res.get("ticket"):
                                     confirmed = True
-                                    self.stats["signals_executed"] += 1
+                                    self._inc_stat("signals_executed")
                                     ticket = res["ticket"]
                                     log_data.update({
                                         "status": "executed",
@@ -1591,14 +1646,14 @@ class OrchestratedMT5Bot:
                                                     f"Price: {signal_data['entry_price']}\nATR: {signal_data.get('atr')}",
                                                 )
                                 else:
-                                    self.stats["execution_errors"] += 1
+                                    self._inc_stat("execution_errors")
                                     log_data.update({
                                         "status": "execution_failed",
                                         "rejection_reason": res.get("error", "Error de ejecución desconocido") if res else "Sin respuesta del broker",
                                     })
                                     log_signal_for_backtest(log_data)
                             else:
-                                self.stats["signals_rejected"] += 1
+                                self._inc_stat("signals_rejected")
                                 log_data.update({
                                     "status": "rejected",
                                     "rejection_reason": verdict.get("reason", "Criterios no cumplidos"),
@@ -1612,6 +1667,10 @@ class OrchestratedMT5Bot:
                             )
                             print(output)
 
+                        except Exception as inner_e:
+                            self.logger.error(f"Error procesando señal para {c.symbol}: {inner_e}")
+                            continue
+
                         finally:
                             proc_time = time.perf_counter() - t0
                             self.cycle_mgr.update_controller_metrics(c, proc_time, had_signal, confirmed)
@@ -1624,10 +1683,10 @@ class OrchestratedMT5Bot:
 
                     cycle_time = time.perf_counter() - t_cycle_start
                     summary_msg = (f"🔄 Ciclo completado: {len(controllers_to_process)} controllers en {cycle_time:.2f}s "
-                                f"| Gen: {self.stats['signals_generated']} "
-                                f"| Apr: {self.stats['signals_approved']} "
-                                f"| Exec: {self.stats['signals_executed']} "
-                                f"| Pos❌: {self.stats['signals_blocked_by_position']} "
+                                f"| Gen: {self._get_stat('signals_generated')} "
+                                f"| Apr: {self._get_stat('signals_approved')} "
+                                f"| Exec: {self._get_stat('signals_executed')} "
+                                f"| Pos❌: {self._get_stat('signals_blocked_by_position')} "
                                 f"(plan={plan.get('reason')})")
                     self.logger.info(summary_msg)
 
@@ -1653,9 +1712,9 @@ class OrchestratedMT5Bot:
 
                 elif plan["action"] in ("wait_for_stability", "wait_for_next_candle"):
                     wait_msg = (f"⏳ {plan['reason']} (espera {plan['wait_seconds']}s) | "
-                                f"Stats: G:{self.stats['signals_generated']} "
-                                f"A:{self.stats['signals_approved']} E:{self.stats['signals_executed']} "
-                                f"Pos❌:{self.stats['signals_blocked_by_position']}")
+                                f"Stats: G:{self._get_stat('signals_generated')} "
+                                f"A:{self._get_stat('signals_approved')} E:{self._get_stat('signals_executed')} "
+                                f"Pos❌:{self._get_stat('signals_blocked_by_position')}")
                     self.logger.info(wait_msg)
 
                     # Cuenta regresiva (usar dt.datetime)
