@@ -25,6 +25,7 @@ class SmartPositionManager:
         corr: CorrelationEngine | None = None,
         close_thresholds: Dict[str, float] | None = None,
         peers_map: Dict[str, list[str]] | None = None,
+        mode: str = "active",
     ):
         self.calc = calc or ProbabilityCalculator()
         self.timer = timer or TimingManager()
@@ -32,11 +33,24 @@ class SmartPositionManager:
         self.trend = trend or TrendChangeDetector()
         self.corr = corr or CorrelationEngine()
 
-        # Umbrales de acción
-        self.close_thresholds = close_thresholds or {
+        # Umbrales de acción (conservamos los tuyos y añadimos llaves nuevas)
+        base_close = close_thresholds or {
             "tighten_sl": 0.70,
             "partial_close": 0.82,
             "close": 0.90,
+        }
+        self.close_thresholds: Dict[str, float] = {
+            **base_close,
+            # TCD explícito
+            "tcd_tighten": 0.55,
+            "tcd_close": 0.70,
+            # Regla de señal opuesta
+            "opp_partial_ml": 0.58,
+            "opp_partial_lb90": 0.52,
+            "opp_close_ml": 0.60,
+            "opp_close_lb90": 0.55,
+            # Tamaño por defecto para parciales
+            "partial_fraction": 0.50,
         }
 
         # Pares de referencia por símbolo (ajústalo a tus instrumentos)
@@ -46,6 +60,9 @@ class SmartPositionManager:
             "AUDUSD": ["NZDUSD"],
             "USDJPY": ["EURUSD", "GBPUSD"],
         }
+
+        # Modo de operación del PMI (el bot principal decide si ejecuta)
+        self.mode = str(mode).lower()
 
     # --------------------------------------------------
     def _factors_for_position(
@@ -95,23 +112,37 @@ class SmartPositionManager:
         }
 
     # --------------------------------------------------
+    # --------------------------------------------------
+    # --------------------------------------------------
     def evaluate(
         self,
         positions: List[Dict[str, Any]],
         market_snapshot: Dict[str, Any],
         candles_by_symbol: Dict[str, Any] | None = None,
         now: dt.datetime | None = None,
+        signal_context_by_symbol: Dict[str, Any] | None = None,
     ) -> List[PMIDecision]:
         """
         Evalúa cada posición y devuelve decisiones PMI.
-        No envía órdenes — el bot principal actuará si corresponde.
+        - Conserva tu pipeline: correlación, TCD, combine() -> close_score.
+        - Añade reglas explícitas de TCD y 'señal opuesta' (usando ML/LB90 si se proveen).
+        - Respeta cooldown por símbolo.
         """
+        def _nz(x, v=0.0):
+            try:
+                return float(x)
+            except Exception:
+                return v
+
         now = now or dt.datetime.utcnow()
         decisions: List[PMIDecision] = []
+        th = self.close_thresholds
 
         for pos in positions:
             symbol = pos["symbol"]
             ticket = int(pos["ticket"])
+            pos_side = str(pos.get("type", pos.get("side", ""))).upper()  # BUY/SELL si estuviera
+
             # cooldown por símbolo (anti-churn)
             if self.timer.is_cooldown(symbol, now):
                 decisions.append(PMIDecision(
@@ -132,11 +163,73 @@ class SmartPositionManager:
                 except Exception:
                     pass
 
-            # Calcula factores y score
+            # Factores base (tu función)
             factors = self._factors_for_position(pos, market_snapshot, candles_by_symbol)
             close_score = self.calc.combine(factors)
 
-            # Determina acción
+            # Contexto de señal reciente (opcional)
+            sc = (signal_context_by_symbol or {}).get(symbol, {}) if signal_context_by_symbol else {}
+            sig_side = str(sc.get("signal_side", "")).upper()  # BUY/SELL
+            ml = _nz(sc.get("ml_confidence"), 0.0)
+            lb90 = _nz(sc.get("historical_prob_lb90"), 0.0)
+
+            # TCD explícito: también podemos usar el del factor si vino calculado
+            # Preferimos el tcd_prob pasado en contexto; si no, usamos 'trend_change' del factor.
+            tcd_prob = _nz(sc.get("tcd_prob"), _nz(factors.get("trend_change"), 0.0))
+
+            # ---------- Decisión por reglas adicionales (sin pisar tu lógica original) ---------- #
+            # 1) Señal opuesta fuerte / media (si conozco el lado de la posición y la señal)
+            if pos_side and sig_side and sig_side != pos_side:
+                if (ml >= th["opp_close_ml"] and lb90 >= th["opp_close_lb90"]) or (tcd_prob >= th["tcd_close"]):
+                    decisions.append(PMIDecision(
+                        ticket=ticket,
+                        action=DecisionAction.CLOSE,
+                        confidence=float(max(close_score, ml, tcd_prob)),
+                        close_score=float(close_score),
+                        reason="opposite_signal_strong",
+                        telemetry={"factors": factors, "ml": ml, "lb90": lb90, "tcd": tcd_prob,
+                                   "pos_side": pos_side, "sig_side": sig_side},
+                    ))
+                    # corta; y además seteo cooldown corto
+                    self.timer.set_cooldown(symbol, minutes=5, now=now)
+                    continue
+                if (ml >= th["opp_partial_ml"] and lb90 >= th["opp_partial_lb90"]):
+                    decisions.append(PMIDecision(
+                        ticket=ticket,
+                        action=DecisionAction.PARTIAL_CLOSE,
+                        confidence=float(max(close_score, ml)),
+                        close_score=float(close_score),
+                        reason="opposite_signal_medium",
+                        telemetry={"factors": factors, "ml": ml, "lb90": lb90, "tcd": tcd_prob,
+                                   "pos_side": pos_side, "sig_side": sig_side,
+                                   "fraction": th["partial_fraction"]},
+                    ))
+                    continue
+
+            # 2) TCD explícito por umbral (independiente del close_score)
+            if tcd_prob >= th["tcd_close"]:
+                decisions.append(PMIDecision(
+                    ticket=ticket,
+                    action=DecisionAction.CLOSE,
+                    confidence=float(max(close_score, tcd_prob)),
+                    close_score=float(close_score),
+                    reason="tcd_close",
+                    telemetry={"factors": factors, "tcd": tcd_prob},
+                ))
+                self.timer.set_cooldown(symbol, minutes=5, now=now)
+                continue
+            if tcd_prob >= th["tcd_tighten"]:
+                decisions.append(PMIDecision(
+                    ticket=ticket,
+                    action=DecisionAction.TIGHTEN_SL,
+                    confidence=float(max(1.0 - close_score, tcd_prob)),
+                    close_score=float(close_score),
+                    reason="tcd_tighten",
+                    telemetry={"factors": factors, "tcd": tcd_prob},
+                ))
+                continue
+
+            # ---------- Tu pipeline original con close_score ---------- #
             if close_score >= self.close_thresholds["close"]:
                 action = DecisionAction.CLOSE
                 confidence = close_score
@@ -161,7 +254,8 @@ class SmartPositionManager:
                 confidence=float(confidence),
                 close_score=float(close_score),
                 reason=reason,
-                telemetry={"factors": factors},
+                telemetry={"factors": factors, "ml": ml, "lb90": lb90, "tcd": tcd_prob,
+                           "pos_side": pos_side, "sig_side": sig_side},
             ))
 
         return decisions

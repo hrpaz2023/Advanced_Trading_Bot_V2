@@ -497,6 +497,10 @@ class OrchestratedMT5Bot:
             print(f"\n🔒 CONTROL DE POSICIONES: ACTIVADO")
             print("   • Prevención de múltiples posiciones por símbolo")
             print("   • Verificación en tiempo real con MT5")
+            pmi_mode = getattr(self, "pmi", None)
+            pmi_mode_txt = getattr(pmi_mode, "mode", "unknown") if pmi_mode else "disabled"
+            lb90_min = getattr(getattr(self, "controllers", [None])[0], "lb90_min", 0.25) if self.controllers else 0.25
+            print(f"\n🧠 PMI: modo={pmi_mode_txt} | LB90_min={lb90_min:.2f}")
             print("="*80 + "\n")
         except Exception as e:
             print(f"⚠️ No se pudo imprimir el resumen de configuración: {e}")
@@ -628,6 +632,47 @@ class OrchestratedMT5Bot:
                 self.logger.warning(f"⚠️ TradingClient intento {name} falló: {e}")
         self.logger.error(f"❌ No se pudo inicializar TradingClient con ninguna firma. Último error: {last_err}")
         return None
+
+    def _resolve_position_size(self, symbol: str, entry_price: float, atr: float, fallback: float = 0.10) -> float:
+        """
+        Devuelve lotes finales usando el RiskManager (que ya lee overrides/fixed_lots de configs/risk_config.json).
+        Si algo falla, usa 'fallback'.
+        """
+        try:
+            # SL aproximado si la estrategia no lo provee: 2*ATR en pips (simple y robusto)
+            is_jpy = symbol.endswith("JPY")
+            pip_factor = 100.0 if is_jpy else 10000.0
+            sl_pips = max(10.0, 2.0 * float(atr) * pip_factor)
+
+            # Equity de la cuenta si está disponible
+            equity = None
+            try:
+                import MetaTrader5 as mt5
+                info = mt5.account_info()
+                equity = float(getattr(info, "equity", 0.0)) if info else None
+            except Exception:
+                pass
+
+            # Calcular tamaño con RiskManager (este ya respeta overrides/fixed)
+            if hasattr(self, "risk_manager") and self.risk_manager:
+                size = self.risk_manager.calculate_position_size(
+                    account_equity=(equity or 10000.0),  # fallback de equity
+                    stop_loss_pips=sl_pips,
+                    symbol=symbol
+                )
+            else:
+                size = fallback
+
+            # Seguridad mínima
+            return max(0.01, float(size))
+
+        except Exception as e:
+            try:
+                self.logger.warning(f"_resolve_position_size fallback por error: {e}")
+            except Exception:
+                pass
+            return max(0.01, float(fallback))
+
 
 # 🔧 MODIFICAR el método _build_controllers (alrededor de línea 470)
     def _build_controllers(self) -> List[ExecutionController]:

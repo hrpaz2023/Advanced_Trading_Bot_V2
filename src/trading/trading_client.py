@@ -263,7 +263,7 @@ class TradingClient:
     
     def market_order(self, symbol: str, side: str, lots: float, price: Optional[float] = None, metadata: Optional[Dict] = None) -> Dict[str, Any]:
         """
-        Ejecuta orden de mercado respetando el lote solicitado.
+        Ejecuta orden de mercado respetando el lote solicitado, con OVERRIDE desde configs/risk_config.json.
         Redondea/clamp al step/min/max de MT5 para evitar 'Invalid volume'.
         """
         if not self.connected:
@@ -271,6 +271,27 @@ class TradingClient:
 
         try:
             import MetaTrader5 as mt5
+            import os, json
+
+            # ----- OVERRIDE desde risk_config -----
+            lots_req = float(lots)
+            for p in ("configs/risk_config.json", "risk_config.json"):
+                if os.path.exists(p):
+                    try:
+                        with open(p, "r", encoding="utf-8") as f:
+                            cfg = json.load(f)
+                        ps = cfg.get("position_sizing", cfg)
+                        mode = str(ps.get("mode", "")).lower()
+                        sym_over = ps.get("symbol_overrides", {}) or {}
+                        if symbol in sym_over:
+                            lots_req = float(sym_over[symbol])
+                            break
+                        if mode == "fixed" and ps.get("fixed_lots") is not None:
+                            lots_req = float(ps["fixed_lots"])
+                            break
+                    except Exception:
+                        pass
+            # -------------------------------------
 
             # Normalización de volumen a parámetros del símbolo
             info = mt5.symbol_info(symbol)
@@ -280,13 +301,12 @@ class TradingClient:
                 step = (getattr(info, "volume_step", 0.01) or 0.01)
                 vmin = (getattr(info, "volume_min", 0.01) or 0.01)
                 vmax = (getattr(info, "volume_max", 100.0) or 100.0)
-            lots_req = float(lots)
             lots_final = max(vmin, min(round(lots_req / step) * step, vmax))
 
-            print(f"🎯 Ejecutando orden de mercado:")
+            print("🎯 Ejecutando orden de mercado:")
             print(f"   Símbolo: {symbol}")
             print(f"   Lado: {side}")
-            print(f"   Lotes solicitados: {lots_req}")
+            print(f"   Lotes solicitados (post-override): {lots_req}")
             print(f"   Lotes normalizados: {lots_final}")
             print(f"   Magic: {self.magic_number}")
 
@@ -302,7 +322,7 @@ class TradingClient:
 
             order_type = mt5.ORDER_TYPE_BUY if side.upper() == "BUY" else mt5.ORDER_TYPE_SELL
 
-            # Comentario
+            # Comentario (31 chars máx MT5)
             comment = f"Bot_{self.magic_number}"
             if metadata:
                 strategy = metadata.get("strategy", "")
@@ -334,16 +354,16 @@ class TradingClient:
             print(f"📥 Resultado MT5:\n   Retcode: {result.retcode}\n   Comment: {getattr(result, 'comment', 'N/A')}")
 
             if result.retcode != mt5.TRADE_RETCODE_DONE:
-                error_msg = f"MT5 Error {result.retcode}"
-                if hasattr(result, 'comment'):
-                    error_msg += f": {result.comment}"
-                return {"error": error_msg, "request": request}
+                return {
+                    "error": f"MT5 Error {result.retcode}: {getattr(result, 'comment', '')}",
+                    "request": request
+                }
 
             ticket = result.order if hasattr(result, 'order') else result.deal
             executed_price = result.price if hasattr(result, 'price') else px
             executed_volume = result.volume if hasattr(result, 'volume') else lots_final
 
-            print(f"✅ Orden ejecutada exitosamente:")
+            print("✅ Orden ejecutada exitosamente:")
             print(f"   Ticket: {ticket}")
             print(f"   Precio: {executed_price}")
             print(f"   Volumen: {executed_volume}")
@@ -354,6 +374,7 @@ class TradingClient:
             import traceback
             traceback.print_exc()
             return {"error": f"Error inesperado en market_order: {e}"}
+
 
     # =========================================================================
     # MÉTODOS AUXILIARES Y LEGACY
