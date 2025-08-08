@@ -1,26 +1,13 @@
 {
-  "risk_per_trade_percent": 1.0,
-  "default_rr_ratio": 2.0,
-  "max_open_trades": 8,
-  "max_correlation_exposure": 0.7,
-  "position_sizing_method": "atr_based",
-  "simulation": {
-    "slippage_points": 2,
-    "commission_per_lot": 7.0,
-    "initial_equity": 200000.0
-  },
-  "performance_thresholds": {
-    "max_daily_loss_percent": -3.0,
-    "max_weekly_loss_percent": -6.0,
-    "max_monthly_loss_percent": -10.0,
-    "max_consecutive_losses": 6,
-    "max_total_drawdown_percent": -8.0
-  },
-  "ftmo_compliance": {
-    "daily_loss_limit_percent": -5.0,
-    "total_loss_limit_percent": -10.0,
-    "minimum_trading_days": 4,
-    "profit_target_phase1": 10.0,
-    "profit_target_phase2": 5.0
+  "position_sizing": {
+    "mode": "fixed",
+    "fixed_lots": 2.0,
+    "allow_override": true,
+    "symbol_overrides": {
+      "EURUSD": 2.0,
+      "GBPUSD": 2.0,
+      "AUDUSD": 2.0,
+      "USDJPY": 2.0
+    }
   }
 }
