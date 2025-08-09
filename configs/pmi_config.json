@@ -1,6 +1,6 @@
 {
   "mode": "active",
-  "lb90_min": 0.25, 
+  "lb90_min": 0.25,
   "thresholds": {
     "opp_strong_ml": 0.45,
     "opp_strong_lb90": 0.35,
@@ -8,20 +8,27 @@
     "opp_medium_lb90": 0.45,
     "weak_close": 0.55,
     "weak_partial": 0.45,
-    "ladder_partial_r": 1.00,
-    "ladder_close_r": 1.50
+    "ladder_partial_r": 1.0,
+    "ladder_close_r": 1.5
   },
   "usd_targets": {
-    "targets": [150.0, 350.0, 600.0],
-    "fractions": [0.50, 0.50, 1.00]
+    "targets": [
+      150.0,
+      350.0,
+      600.0
+    ],
+    "fractions": [
+      0.5,
+      0.5,
+      1.0
+    ]
   },
   "hold_policy": {
     "grace_minutes": 90,
-    "min_r_after_grace": 0.20,
+    "min_r_after_grace": 0.2,
     "max_hours": 12,
-    "min_r_after_max": 0.30,
-    "partial_fraction": 0.50,
-
+    "min_r_after_max": 0.3,
+    "partial_fraction": 0.5,
     "breakeven_enabled": true,
     "breakeven_after_minutes": 60,
     "breakeven_weak_threshold": 0.55,
@@ -29,9 +36,96 @@
     "breakeven_extra_buffer": 0.0
   },
   "sr_levels": {
-    "EURUSD": { "support": 1.1600, "resistance": 1.1710 },
-    "GBPUSD": { "support": 1.3350, "resistance": 1.3500 },
-    "AUDUSD": { "support": 0.6480, "resistance": 0.6535 },
-    "USDJPY": { "support": 146.40, "resistance": 147.90 }
+    "EURUSD": {
+      "support": 1.16,
+      "resistance": 1.171
+    },
+    "GBPUSD": {
+      "support": 1.335,
+      "resistance": 1.35
+    },
+    "AUDUSD": {
+      "support": 0.648,
+      "resistance": 0.6535
+    },
+    "USDJPY": {
+      "support": 146.4,
+      "resistance": 147.9
+    }
+  },
+  "defaults": {},
+  "symbols": {
+    "EURUSD": {
+      "max_hours": 12,
+      "fractions": [
+        0.5,
+        0.5,
+        1.0
+      ],
+      "commission_buffer_usd": 2.0,
+      "breakeven_weak_threshold": 0.5,
+      "commission_per_lot": 3.0,
+      "breakeven_after_min": 45,
+      "targets_usd": [
+        150,
+        350,
+        600
+      ],
+      "grace_minutes": 120
+    },
+    "GBPUSD": {
+      "max_hours": 8,
+      "fractions": [
+        0.5,
+        0.5,
+        1.0
+      ],
+      "commission_buffer_usd": 0.0,
+      "breakeven_weak_threshold": 0.55,
+      "commission_per_lot": 3.0,
+      "breakeven_after_min": 60,
+      "targets_usd": [
+        120,
+        300,
+        550
+      ],
+      "grace_minutes": 120
+    },
+    "AUDUSD": {
+      "max_hours": 12,
+      "fractions": [
+        0.5,
+        0.5,
+        1.0
+      ],
+      "commission_buffer_usd": 2.0,
+      "breakeven_weak_threshold": 0.5,
+      "commission_per_lot": 3.0,
+      "breakeven_after_min": 45,
+      "targets_usd": [
+        150,
+        350,
+        600
+      ],
+      "grace_minutes": 120
+    },
+    "USDJPY": {
+      "max_hours": 12,
+      "fractions": [
+        0.5,
+        0.5,
+        1.0
+      ],
+      "commission_buffer_usd": 2.0,
+      "breakeven_weak_threshold": 0.5,
+      "commission_per_lot": 3.0,
+      "breakeven_after_min": 45,
+      "targets_usd": [
+        150,
+        350,
+        600
+      ],
+      "grace_minutes": 120
+    }
   }
 }
