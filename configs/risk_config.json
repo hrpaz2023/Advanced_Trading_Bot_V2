@@ -4,10 +4,10 @@
     "fixed_lots": 2.0,
     "allow_override": true,
     "symbol_overrides": {
-      "EURUSD": 2.0,
-      "GBPUSD": 2.0,
-      "AUDUSD": 2.0,
-      "USDJPY": 2.0
+      "EURUSD": 3.0,
+      "GBPUSD": 3.0,
+      "AUDUSD": 3.0,
+      "USDJPY": 3.0
     }
   }
 }

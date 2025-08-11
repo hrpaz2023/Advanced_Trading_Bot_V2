@@ -1,0 +1,29 @@
+{
+  "position_sizing": {
+    "mode": "percent_risk",
+    "risk_per_trade_pct": 1.0,
+    "max_daily_equity_drawdown_pct_soft": 1.5,
+    "max_daily_equity_drawdown_pct_hard": 3.0,
+    "fixed_lots": 0.20,
+    "symbol_overrides": {
+      "EURUSD": { "max_lots": 0.30 },
+      "GBPUSD": { "max_lots": 0.25 },
+      "AUDUSD": { "max_lots": 0.30 },
+      "USDJPY": { "max_lots": 0.30 }
+    }
+  },
+  "session_limits": {
+    "max_concurrent_positions": 3,
+    "max_per_symbol": 1,
+    "correlation_guard": true
+  },
+  "equity_stops": {
+    "stop_on_soft": true,
+    "stop_on_hard": true
+  },
+  "pmi_integration": {
+    "apply_decisions": true,
+    "close_on_opposite_strong": true,
+    "breakeven_after_minutes": 45
+  }
+}

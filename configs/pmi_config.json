@@ -2,10 +2,10 @@
   "mode": "active",
   "lb90_min": 0.25,
   "thresholds": {
-    "opp_strong_ml": 0.45,
-    "opp_strong_lb90": 0.35,
+    "opp_strong_ml": 0.50,
+    "opp_strong_lb90": 0.45,
     "opp_medium_ml": 0.55,
-    "opp_medium_lb90": 0.45,
+    "opp_medium_lb90": 0.50,
     "weak_close": 0.55,
     "weak_partial": 0.45,
     "ladder_partial_r": 1.0,

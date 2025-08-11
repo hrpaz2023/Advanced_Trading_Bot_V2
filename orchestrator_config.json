@@ -15,8 +15,8 @@
   },
 
   "thresholds": {
-    "ml_confidence_min": 0.30,
-    "historical_prob_min": 0.30,
+    "ml_confidence_min": 0.35,
+    "historical_prob_min": 0.35,
     "orchestrator_score_min": 0.00,
     "max_spread_pips": 3.0,
     "max_atr_multiple": 4.0,
@@ -26,7 +26,7 @@
 
   "sizing": {
     "risk_per_trade_pct": 1.0,
-    "base_lots": 2,
+    "base_lots": 3,
     "atr_scale": { "M5": 1.0 }
   },
 
